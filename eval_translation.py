@@ -1,4 +1,5 @@
-# Copyright (C) 2016-2018  Mikel Artetxe <artetxem@gmail.com>
+# Copyright (C) 2019 Yuval Pinter <yuvalpinter@gmail.com>
+#               2016-2018  Mikel Artetxe <artetxem@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -73,6 +74,7 @@ def main():
     trgfile = open(args.trg_embeddings, encoding=args.encoding, errors='surrogateescape')
     src_words, x = embeddings.read(srcfile, dtype=dtype)
     trg_words, z = embeddings.read(trgfile, dtype=dtype)
+    print('embeddings read')
 
     # NumPy/CuPy management
     if args.cuda:
@@ -112,6 +114,7 @@ def main():
     src = list(src2trg.keys())
     oov -= vocab  # If one of the translation options is in the vocabulary, then the entry is not an oov
     coverage = len(src2trg) / (len(src2trg) + len(oov))
+    print(f'dictionary read with {coverage} coverage')
 
     # Find translations
     translation = collections.defaultdict(int)

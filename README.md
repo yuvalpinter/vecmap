@@ -184,6 +184,7 @@ If you use this software for academic research, please cite the relevant paper(s
 License
 -------
 
-Copyright (C) 2016-2018, Mikel Artetxe
+Copyright (C) 2019, Yuval Pinter
+			  2016-2018, Mikel Artetxe
 
 Licensed under the terms of the GNU General Public License, either version 3 or (at your option) any later version. A full copy of the license can be found in LICENSE.txt.

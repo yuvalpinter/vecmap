@@ -1,4 +1,5 @@
-# Copyright (C) 2016-2018  Mikel Artetxe <artetxem@gmail.com>
+# Copyright (C) 2019 Yuval Pinter <yuvalpinter@gmail.com>
+#               2016-2018  Mikel Artetxe <artetxem@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -106,7 +107,7 @@ def main():
     self_learning_group.add_argument('--stochastic_initial', default=0.1, type=float, help='initial keep probability stochastic dictionary induction (defaults to 0.1)')
     self_learning_group.add_argument('--stochastic_multiplier', default=2.0, type=float, help='stochastic dictionary induction multiplier (defaults to 2.0)')
     self_learning_group.add_argument('--stochastic_interval', default=50, type=int, help='stochastic dictionary induction interval (defaults to 50)')
-    self_learning_group.add_argument('--log', help='write to a log file in tsv format at each iteration')
+    self_learning_group.add_argument('--log', default='map.log', help='write to a log file in tsv format at each iteration')
     self_learning_group.add_argument('-v', '--verbose', action='store_true', help='write log information to stderr at each iteration')
     args = parser.parse_args()
 
@@ -142,10 +143,12 @@ def main():
         dtype = 'float64'
 
     # Read input embeddings
+    print('reading embeddings...')
     srcfile = open(args.src_input, encoding=args.encoding, errors='surrogateescape')
     trgfile = open(args.trg_input, encoding=args.encoding, errors='surrogateescape')
     src_words, x = embeddings.read(srcfile, dtype=dtype)
     trg_words, z = embeddings.read(trgfile, dtype=dtype)
+    print('embeddings read')
 
     # NumPy/CuPy management
     if args.cuda:
@@ -155,17 +158,21 @@ def main():
         xp = get_cupy()
         x = xp.asarray(x)
         z = xp.asarray(z)
+        print('CUDA loaded')
     else:
         xp = np
     xp.random.seed(args.seed)
 
     # Build word to index map
     src_word2ind = {word: i for i, word in enumerate(src_words)}
+    print(f'mapped {len(src_words)} source words')
     trg_word2ind = {word: i for i, word in enumerate(trg_words)}
+    print(f'mapped {len(trg_words)} target words')
 
     # STEP 0: Normalization
     embeddings.normalize(x, args.normalize)
     embeddings.normalize(z, args.normalize)
+    print('normalization complete')
 
     # Build the seed dictionary
     src_indices = []
@@ -196,6 +203,7 @@ def main():
             src_indices = xp.concatenate((xp.arange(sim_size), sim.argmax(axis=0)))
             trg_indices = xp.concatenate((sim.argmax(axis=1), xp.arange(sim_size)))
         del xsim, zsim, sim
+        print('initialized unsupervised dictionary')
     elif args.init_numerals:
         numeral_regex = re.compile('^[0-9]+$')
         src_numerals = {word for word in src_words if numeral_regex.match(word) is not None}
@@ -204,11 +212,13 @@ def main():
         for word in numerals:
             src_indices.append(src_word2ind[word])
             trg_indices.append(trg_word2ind[word])
+        print('initialized numeral dictionary')
     elif args.init_identical:
         identical = set(src_words).intersection(set(trg_words))
         for word in identical:
             src_indices.append(src_word2ind[word])
             trg_indices.append(trg_word2ind[word])
+        print('initialized identical dictionary')
     else:
         f = open(args.init_dictionary, encoding=args.encoding, errors='surrogateescape')
         for line in f:
@@ -220,6 +230,8 @@ def main():
                 trg_indices.append(trg_ind)
             except KeyError:
                 print('WARNING: OOV dictionary entry ({0} - {1})'.format(src, trg), file=sys.stderr)
+        f.close()
+        print('initialized seed dictionary')
 
     # Read validation dictionary
     if args.validation is not None:
@@ -238,10 +250,12 @@ def main():
                 oov.add(src)
         oov -= vocab  # If one of the translation options is in the vocabulary, then the entry is not an oov
         validation_coverage = len(validation) / (len(validation) + len(oov))
+        print(f'loaded validation dictionary with {validation_coverage:.3f} coverage')
 
     # Create log file
     if args.log:
         log = open(args.log, mode='w', encoding=args.encoding, errors='surrogateescape')
+        print(f'logging into {args.log}')
 
     # Allocate memory
     xw = xp.empty_like(x)
@@ -269,9 +283,12 @@ def main():
     keep_prob = args.stochastic_initial
     t = time.time()
     end = not args.self_learning
+    print('starting training')
     while True:
+        if it % 50 == 0:
+            print(f'starting iteration {it}')
 
-        # Increase the keep probability if we have not improve in args.stochastic_interval iterations
+        # Increase the keep probability if we have not improved in args.stochastic_interval iterations
         if it - last_improvement > args.stochastic_interval:
             if keep_prob >= 1.0:
                 end = True
@@ -294,6 +311,8 @@ def main():
             # TODO xw.dot(wx2, out=xw) and alike not working
             xw[:] = x
             zw[:] = z
+            
+            ### TODO entry point for adding more matrix operations ###
 
             # STEP 1: Whitening
             def whitening_transformation(m):
@@ -338,7 +357,7 @@ def main():
             if args.direction in ('forward', 'union'):
                 if args.csls_neighborhood > 0:
                     for i in range(0, trg_size, simbwd.shape[0]):
-                        j = min(i + simbwd.shape[0], trg_size)
+                        j = min(i + simbwd.shape[0], trg_size)  # get next batch to operate on
                         zw[i:j].dot(xw[:src_size].T, out=simbwd[:j-i])
                         knn_sim_bwd[i:j] = topk_mean(simbwd[:j-i], k=args.csls_neighborhood, inplace=True)
                 for i in range(0, src_size, simfwd.shape[0]):
@@ -346,11 +365,14 @@ def main():
                     xw[i:j].dot(zw[:trg_size].T, out=simfwd[:j-i])
                     simfwd[:j-i].max(axis=1, out=best_sim_forward[i:j])
                     simfwd[:j-i] -= knn_sim_bwd/2  # Equivalent to the real CSLS scores for NN
+                    
+                    ### TODO entry point for softmaxing ###
+                    
                     dropout(simfwd[:j-i], 1 - keep_prob).argmax(axis=1, out=trg_indices_forward[i:j])
             if args.direction in ('backward', 'union'):
                 if args.csls_neighborhood > 0:
                     for i in range(0, src_size, simfwd.shape[0]):
-                        j = min(i + simfwd.shape[0], src_size)
+                        j = min(i + simfwd.shape[0], src_size)  # get next batch to operate on
                         xw[i:j].dot(zw[:trg_size].T, out=simfwd[:j-i])
                         knn_sim_fwd[i:j] = topk_mean(simfwd[:j-i], k=args.csls_neighborhood, inplace=True)
                 for i in range(0, trg_size, simbwd.shape[0]):
@@ -358,6 +380,9 @@ def main():
                     zw[i:j].dot(xw[:src_size].T, out=simbwd[:j-i])
                     simbwd[:j-i].max(axis=1, out=best_sim_backward[i:j])
                     simbwd[:j-i] -= knn_sim_fwd/2  # Equivalent to the real CSLS scores for NN
+                    
+                    ### TODO entry point for softmaxing ###
+                    
                     dropout(simbwd[:j-i], 1 - keep_prob).argmax(axis=1, out=src_indices_backward[i:j])
             if args.direction == 'forward':
                 src_indices = src_indices_forward
