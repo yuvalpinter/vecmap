@@ -114,7 +114,7 @@ def main():
     src = list(src2trg.keys())
     oov -= vocab  # If one of the translation options is in the vocabulary, then the entry is not an oov
     coverage = len(src2trg) / (len(src2trg) + len(oov))
-    print(f'dictionary read with {coverage} coverage')
+    print(f'dictionary read')
 
     # Find translations
     translation = collections.defaultdict(int)

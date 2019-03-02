@@ -23,6 +23,7 @@ import numpy as np
 import re
 import sys
 import time
+import pickle
 
 
 def dropout(m, p):
@@ -71,6 +72,7 @@ def main():
     recommended_type.add_argument('--semi_supervised', metavar='DICTIONARY', help='recommended if you have a small seed dictionary')
     recommended_type.add_argument('--identical', action='store_true', help='recommended if you have no seed dictionary but can rely on identical words')
     recommended_type.add_argument('--unsupervised', action='store_true', help='recommended if you have no seed dictionary and do not want to rely on identical words')
+    recommended_type.add_argument('--future', action='store_true', help='experiment with stuff')
     recommended_type.add_argument('--acl2018', action='store_true', help='reproduce our ACL 2018 system')
     recommended_type.add_argument('--aaai2018', metavar='DICTIONARY', help='reproduce our AAAI 2018 system')
     recommended_type.add_argument('--acl2017', action='store_true', help='reproduce our ACL 2017 system with numeral initialization')
@@ -96,6 +98,10 @@ def main():
     mapping_type = mapping_group.add_mutually_exclusive_group()
     mapping_type.add_argument('-c', '--orthogonal', action='store_true', help='use orthogonal constrained mapping')
     mapping_type.add_argument('-u', '--unconstrained', action='store_true', help='use unconstrained mapping')
+    
+    future_group = parser.add_argument_group('experimental arguments', 'Experimental arguments')
+    future_group.add_argument('--max_align', type=int, default=1, help='Number of top-ranked elements to align to each word (defaults to 1=base)')
+    future_group.add_argument('--align_weight', choices=['unit', 'rr', 'softmax'], default='rr', help='Weights assigned to ranked elements in maximization phase (unit - no weighting; rr - reciprocal rank; softmax - NOT IMPLEMENTED YET)')
 
     self_learning_group = parser.add_argument_group('advanced self-learning arguments', 'Advanced arguments for self-learning')
     self_learning_group.add_argument('--self_learning', action='store_true', help='enable self-learning')
@@ -117,6 +123,9 @@ def main():
         parser.set_defaults(init_dictionary=args.semi_supervised, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', self_learning=True, vocabulary_cutoff=20000, csls_neighborhood=10)
     if args.identical:
         parser.set_defaults(init_identical=True, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', self_learning=True, vocabulary_cutoff=20000, csls_neighborhood=10)
+    
+    if args.unsupervised or args.future:
+        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', self_learning=True, vocabulary_cutoff=20000, csls_neighborhood=10, max_align=2, align_weight='rr')
     if args.unsupervised or args.acl2018:
         parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', self_learning=True, vocabulary_cutoff=20000, csls_neighborhood=10)
     if args.aaai2018:
@@ -163,7 +172,7 @@ def main():
         xp = np
     xp.random.seed(args.seed)
 
-    # Build word to index map
+    # Build word to index map (only relevant in supervised learning or with validation)
     src_word2ind = {word: i for i, word in enumerate(src_words)}
     print(f'mapped {len(src_words)} source words')
     trg_word2ind = {word: i for i, word in enumerate(trg_words)}
@@ -203,7 +212,7 @@ def main():
             src_indices = xp.concatenate((xp.arange(sim_size), sim.argmax(axis=0)))
             trg_indices = xp.concatenate((sim.argmax(axis=1), xp.arange(sim_size)))
         del xsim, zsim, sim
-        print('initialized unsupervised dictionary')
+        print(f'initialized unsupervised dictionary')
     elif args.init_numerals:
         numeral_regex = re.compile('^[0-9]+$')
         src_numerals = {word for word in src_words if numeral_regex.match(word) is not None}
@@ -262,17 +271,24 @@ def main():
     zw = xp.empty_like(z)
     src_size = x.shape[0] if args.vocabulary_cutoff <= 0 else min(x.shape[0], args.vocabulary_cutoff)
     trg_size = z.shape[0] if args.vocabulary_cutoff <= 0 else min(z.shape[0], args.vocabulary_cutoff)
-    simfwd = xp.empty((args.batch_size, trg_size), dtype=dtype)
-    simbwd = xp.empty((args.batch_size, src_size), dtype=dtype)
+    simfwd = xp.empty((min(src_size, args.batch_size), trg_size), dtype=dtype)
+    simbwd = xp.empty((min(trg_size, args.batch_size), src_size), dtype=dtype)
+    #argsimsf = xp.empty((min(src_size, args.batch_size), args.max_align), dtype=int)
+    #argsimsb = xp.empty((min(trg_size, args.batch_size), args.max_align), dtype=int)
+    argsimsf = xp.empty((min(src_size, args.batch_size), 1), dtype=int)
+    argsimsb = xp.empty((min(trg_size, args.batch_size), 1), dtype=int)
     if args.validation is not None:
         simval = xp.empty((len(validation.keys()), z.shape[0]), dtype=dtype)
 
     best_sim_forward = xp.full(src_size, -100, dtype=dtype)
-    src_indices_forward = xp.arange(src_size)
-    trg_indices_forward = xp.zeros(src_size, dtype=int)
+    src_indices_forward = xp.array(list(range(src_size)) * args.max_align)
+    trg_indices_forward = xp.zeros(src_size * args.max_align, dtype=int)
     best_sim_backward = xp.full(trg_size, -100, dtype=dtype)
-    src_indices_backward = xp.zeros(trg_size, dtype=int)
-    trg_indices_backward = xp.arange(trg_size)
+    src_indices_backward = xp.zeros(trg_size * args.max_align, dtype=int)
+    trg_indices_backward = xp.array(list(range(trg_size)) * args.max_align)
+    xr = xp.zeros(((src_size+trg_size) * args.max_align, x.shape[1]), dtype=dtype)  # assumes "both" param
+    zr = xp.zeros(((src_size+trg_size) * args.max_align, z.shape[1]), dtype=dtype)  # assumes "both" param
+    all_coefs = xp.zeros(((src_size+trg_size) * args.max_align, 1), dtype=dtype)
     knn_sim_fwd = xp.zeros(src_size, dtype=dtype)
     knn_sim_bwd = xp.zeros(trg_size, dtype=dtype)
 
@@ -295,9 +311,29 @@ def main():
             keep_prob = min(1.0, args.stochastic_multiplier*keep_prob)
             last_improvement = it
 
-        # Update the embedding mapping
+        # Update the embedding mapping (only affecting vectors that have dictionary mappings)
         if args.orthogonal or not end:  # orthogonal mapping
-            u, s, vt = xp.linalg.svd(z[trg_indices].T.dot(x[src_indices]))
+            ### TODO I'm assuming here that the alignment method is 'both', so everything's double
+            # format: src_size_0, ..., src_size_k-1, trg_size_0, ..., trg_size_k-1
+            ncopies = args.max_align
+            cutoffs = list(range(src_size*ncopies)[::src_size]) \
+                      + list(range(src_size*ncopies,(src_size+trg_size)*ncopies)[::trg_size])
+            if it == 1:
+                u, s, vt = xp.linalg.svd(z[trg_indices].T.dot(x[src_indices]))
+            else:
+                if args.align_weight == 'softmax':
+                    ### TODO individualized softmax coefficients ###
+                    raise 'Softmax weights not supported yet'           
+                else:
+                    if args.align_weight == 'rr':
+                        coefs = [1. / (k+1) for k in range(ncopies)] * 2            
+                    else:  # 'unit'
+                        coefs = [1.] * (ncopies * 2)
+                    for cf, co_s, co_e in zip(coefs, cutoffs, cutoffs[1:] + [len(all_coefs)]):
+                        all_coefs[co_s:co_e] = cf
+                    zr = z[trg_indices] * all_coefs
+                    xr = x[src_indices] * all_coefs
+                    u, s, vt = xp.linalg.svd(zr.T.dot(xr))
             w = vt.T.dot(u.T)
             x.dot(w, out=xw)
             zw[:] = z
@@ -306,7 +342,7 @@ def main():
             w = x_pseudoinv.dot(z[trg_indices])
             x.dot(w, out=xw)
             zw[:] = z
-        else:  # advanced mapping
+        else:  # advanced mapping (default for end, acl2018)
 
             # TODO xw.dot(wx2, out=xw) and alike not working
             xw[:] = x
@@ -325,6 +361,7 @@ def main():
                 zw = zw.dot(wz1)
 
             # STEP 2: Orthogonal mapping
+            ### TODO take care of k-best indices ###
             wx2, s, wz2_t = xp.linalg.svd(xw[src_indices].T.dot(zw[trg_indices]))
             wz2 = wz2_t.T
             xw = xw.dot(wx2)
@@ -344,7 +381,7 @@ def main():
             elif args.trg_dewhiten == 'trg':
                 zw = zw.dot(wz2.T.dot(xp.linalg.inv(wz1)).dot(wz2))
 
-            # STEP 5: Dimensionality reduction
+            # STEP 5: Dimensionality reduction (default: OFF (0))
             if args.dim_reduction > 0:
                 xw = xw[:, :args.dim_reduction]
                 zw = zw[:, :args.dim_reduction]
@@ -353,9 +390,9 @@ def main():
         if end:
             break
         else:
-            # Update the training dictionary
+            # Update the training dictionary (default direction - union)
             if args.direction in ('forward', 'union'):
-                if args.csls_neighborhood > 0:
+                if args.csls_neighborhood > 0:  # default acl2018: 10
                     for i in range(0, trg_size, simbwd.shape[0]):
                         j = min(i + simbwd.shape[0], trg_size)  # get next batch to operate on
                         zw[i:j].dot(xw[:src_size].T, out=simbwd[:j-i])
@@ -366,9 +403,13 @@ def main():
                     simfwd[:j-i].max(axis=1, out=best_sim_forward[i:j])
                     simfwd[:j-i] -= knn_sim_bwd/2  # Equivalent to the real CSLS scores for NN
                     
-                    ### TODO entry point for softmaxing ###
-                    
-                    dropout(simfwd[:j-i], 1 - keep_prob).argmax(axis=1, out=trg_indices_forward[i:j])
+                    # softmaxing
+                    #argsimsf[:] = dropout(-simfwd[:j-i], 1 - keep_prob).argsort(axis=1)[:,:args.max_align]
+                    for k in range(args.max_align):
+                        argsimsf = dropout(simfwd[:j-i], 1 - keep_prob).argmax(axis=1)
+                        simfwd[:j-i,argsimsf] = -200
+                        trg_indices_forward[(k*src_size)+i:(k*src_size)+j] = argsimsf
+                        #trg_indices_forward[(k*src_size)+i:(k*src_size)+j] = argsimsf[:,k]
             if args.direction in ('backward', 'union'):
                 if args.csls_neighborhood > 0:
                     for i in range(0, src_size, simfwd.shape[0]):
@@ -381,9 +422,13 @@ def main():
                     simbwd[:j-i].max(axis=1, out=best_sim_backward[i:j])
                     simbwd[:j-i] -= knn_sim_fwd/2  # Equivalent to the real CSLS scores for NN
                     
-                    ### TODO entry point for softmaxing ###
-                    
-                    dropout(simbwd[:j-i], 1 - keep_prob).argmax(axis=1, out=src_indices_backward[i:j])
+                    # softmaxing
+                    #argsimsb[:] = dropout(-simbwd[:j-i], 1 - keep_prob).argsort(axis=1)[:,:args.max_align]
+                    for k in range(args.max_align):
+                        argsimsb = dropout(simbwd[:j-i], 1 - keep_prob).argmax(axis=1)
+                        simbwd[:j-i,argsimsb] = -200
+                        trg_indices_backward[(k*trg_size)+i:(k*trg_size)+j] = argsimsb
+                        #src_indices_backward[(k*trg_size)+i:(k*trg_size)+j] = argsimsb[:,k]
             if args.direction == 'forward':
                 src_indices = src_indices_forward
                 trg_indices = trg_indices_forward
@@ -399,13 +444,13 @@ def main():
                 objective = xp.mean(best_sim_forward).tolist()
             elif args.direction == 'backward':
                 objective = xp.mean(best_sim_backward).tolist()
-            elif args.direction == 'union':
+            elif args.direction == 'union':  # default
                 objective = (xp.mean(best_sim_forward) + xp.mean(best_sim_backward)).tolist() / 2
             if objective - best_objective >= args.threshold:
                 last_improvement = it
                 best_objective = objective
 
-            # Accuracy and similarity evaluation in validation
+            # Accuracy and similarity evaluation in validation (default - off)
             if args.validation is not None:
                 src = list(validation.keys())
                 xw[src].dot(zw.T, out=simval)
@@ -441,6 +486,11 @@ def main():
     embeddings.write(trg_words, zw, trgfile)
     srcfile.close()
     trgfile.close()
+    
+    # Write dictionary
+    dictfile = open('dictionary.pkl', mode='wb')
+    dictalign = list(zip(src_indices, trg_indices))
+    pickle.dump(dictalign, dictfile)
 
 
 if __name__ == '__main__':
