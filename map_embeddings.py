@@ -273,8 +273,10 @@ def main():
     trg_size = z.shape[0] if args.vocabulary_cutoff <= 0 else min(z.shape[0], args.vocabulary_cutoff)
     simfwd = xp.empty((min(src_size, args.batch_size), trg_size), dtype=dtype)
     simbwd = xp.empty((min(trg_size, args.batch_size), src_size), dtype=dtype)
-    argsimsf = xp.empty((min(trg_size, args.batch_size), args.max_align), dtype=int)
-    argsimsb = xp.empty((min(src_size, args.batch_size), args.max_align), dtype=int)
+    #argsimsf = xp.empty((min(src_size, args.batch_size), args.max_align), dtype=int)
+    #argsimsb = xp.empty((min(trg_size, args.batch_size), args.max_align), dtype=int)
+    argsimsf = xp.empty((min(src_size, args.batch_size), 1), dtype=int)
+    argsimsb = xp.empty((min(trg_size, args.batch_size), 1), dtype=int)
     if args.validation is not None:
         simval = xp.empty((len(validation.keys()), z.shape[0]), dtype=dtype)
 
@@ -402,9 +404,12 @@ def main():
                     simfwd[:j-i] -= knn_sim_bwd/2  # Equivalent to the real CSLS scores for NN
                     
                     # softmaxing
-                    argsimsf = dropout(simfwd[:j-i], 1 - keep_prob).argsort(axis=1)[:,-args.max_align:]
+                    #argsimsf[:] = dropout(-simfwd[:j-i], 1 - keep_prob).argsort(axis=1)[:,:args.max_align]
                     for k in range(args.max_align):
-                        trg_indices_forward[(k*src_size)+i:(k*src_size)+j] = argsimsf[:,-(k+1)]
+                        argsimsf = dropout(simfwd[:j-i], 1 - keep_prob).argmax(axis=1)
+                        simfwd[:j-i,argsimsf] = -200
+                        trg_indices_forward[(k*src_size)+i:(k*src_size)+j] = argsimsf
+                        #trg_indices_forward[(k*src_size)+i:(k*src_size)+j] = argsimsf[:,k]
             if args.direction in ('backward', 'union'):
                 if args.csls_neighborhood > 0:
                     for i in range(0, src_size, simfwd.shape[0]):
@@ -418,9 +423,12 @@ def main():
                     simbwd[:j-i] -= knn_sim_fwd/2  # Equivalent to the real CSLS scores for NN
                     
                     # softmaxing
-                    argsimsb = dropout(simbwd[:j-i], 1 - keep_prob).argsort(axis=1)[:,-args.max_align:]
+                    #argsimsb[:] = dropout(-simbwd[:j-i], 1 - keep_prob).argsort(axis=1)[:,:args.max_align]
                     for k in range(args.max_align):
-                        src_indices_backward[(k*trg_size)+i:(k*trg_size)+j] = argsimsb[:,-(k+1)]
+                        argsimsb = dropout(simbwd[:j-i], 1 - keep_prob).argmax(axis=1)
+                        simbwd[:j-i,argsimsb] = -200
+                        trg_indices_backward[(k*trg_size)+i:(k*trg_size)+j] = argsimsb
+                        #src_indices_backward[(k*trg_size)+i:(k*trg_size)+j] = argsimsb[:,k]
             if args.direction == 'forward':
                 src_indices = src_indices_forward
                 trg_indices = trg_indices_forward
