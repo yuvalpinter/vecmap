@@ -311,6 +311,19 @@ def main():
                 end = True
             keep_prob = min(1.0, args.stochastic_multiplier*keep_prob)
             last_improvement = it
+            
+        ### UNDER CONSTRUCTION - SENSE EMBEDDING PHASE ###  
+        
+        # sdh is a *fixed* src_size * src_s_size sparse matrix (S^h in paper)
+        # sx is a src_s_size * sdim embedding table (\tilde{E}^h)
+        # sy is a src_s_size * sdim embedding table (\tilde{E}^l)
+        # lambda is a regularization hyperparam
+        
+        ccx = xw - sdh.dot(sy) # Y in eq. (10)
+        del_sx = xp.linalg.inv(sdh.dot(sdh.transpose())+(xp.identity(src_size)*(1./lambda)))\
+                    .dot(sdh.transpose()).dot(ccx) # eq. (11)
+            
+        ### END CONSTRUCTION - SENSE EMBEDDING PHASE ###
 
         # Update the embedding mapping (only affecting vectors that have dictionary mappings)
         if args.orthogonal or not end:  # orthogonal mapping
