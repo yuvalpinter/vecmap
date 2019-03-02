@@ -344,6 +344,11 @@ def main():
             zw[:] = z
         else:  # advanced mapping (default for end, acl2018)
 
+            # remove lower-rank transformations
+            midpoint = src_size * args.max_align
+            src_indices = xp.concatenate((src_indices[:src_size], src_indices[midpoint:midpoint+trg_size]))
+            trg_indices = xp.concatenate((trg_indices[:src_size], trg_indices[midpoint:midpoint+trg_size]))
+            
             # TODO xw.dot(wx2, out=xw) and alike not working
             xw[:] = x
             zw[:] = z
@@ -351,6 +356,7 @@ def main():
             ### TODO entry point for adding more matrix operations ###
 
             # STEP 1: Whitening
+            ### TODO figure out how weighted k-best affects this (and onwards) ###
             def whitening_transformation(m):
                 u, s, vt = xp.linalg.svd(m, full_matrices=False)
                 return vt.T.dot(xp.diag(1/s)).dot(vt)
