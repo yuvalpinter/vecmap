@@ -24,6 +24,7 @@ import re
 import sys
 import time
 import pickle
+from scipy.sparse import csr_matrix
 
 
 def dropout(m, p):
@@ -58,6 +59,7 @@ def main():
     parser = argparse.ArgumentParser(description='Map word embeddings in two languages into a shared space')
     parser.add_argument('src_input', help='the input source embeddings')
     parser.add_argument('trg_input', help='the input target embeddings')
+    parser.add_argument('sense_input', help='the input sense mapping matrix')
     parser.add_argument('src_output', help='the output source embeddings')
     parser.add_argument('trg_output', help='the output target embeddings')
     parser.add_argument('dict_output', default='dictionary.pkl', help='the output dictionary pickle file')
@@ -75,10 +77,6 @@ def main():
     recommended_type.add_argument('--unsupervised', action='store_true', help='recommended if you have no seed dictionary and do not want to rely on identical words')
     recommended_type.add_argument('--future', action='store_true', help='experiment with stuff')
     recommended_type.add_argument('--acl2018', action='store_true', help='reproduce our ACL 2018 system')
-    recommended_type.add_argument('--aaai2018', metavar='DICTIONARY', help='reproduce our AAAI 2018 system')
-    recommended_type.add_argument('--acl2017', action='store_true', help='reproduce our ACL 2017 system with numeral initialization')
-    recommended_type.add_argument('--acl2017_seed', metavar='DICTIONARY', help='reproduce our ACL 2017 system with a seed dictionary')
-    recommended_type.add_argument('--emnlp2016', metavar='DICTIONARY', help='reproduce our EMNLP 2016 system')
 
     init_group = parser.add_argument_group('advanced initialization arguments', 'Advanced initialization arguments')
     init_type = init_group.add_mutually_exclusive_group()
@@ -98,12 +96,13 @@ def main():
     mapping_group.add_argument('--dim_reduction', type=int, default=0, help='apply dimensionality reduction')
     mapping_type = mapping_group.add_mutually_exclusive_group()
     mapping_type.add_argument('-c', '--orthogonal', action='store_true', help='use orthogonal constrained mapping')
-    mapping_type.add_argument('-u', '--unconstrained', action='store_true', help='use unconstrained mapping')
     
     future_group = parser.add_argument_group('experimental arguments', 'Experimental arguments')
     future_group.add_argument('--max_align', type=int, default=1, help='Number of top-ranked elements to align to each word (defaults to 1=base)')
     future_group.add_argument('--align_weight', choices=['unit', 'rr', 'softmax'], default='rr', help='Weights assigned to ranked elements in maximization phase (unit - no weighting; rr - reciprocal rank; softmax - NOT IMPLEMENTED YET)')
-
+    future_group.add_argument('--lamb', type=float, default=0.5, help='Weight hyperparameter for sense alignment objectives')
+    future_group.add_argument('--sense_init', choices=['none', 'glorot'], default='glorot')
+    
     self_learning_group = parser.add_argument_group('advanced self-learning arguments', 'Advanced arguments for self-learning')
     self_learning_group.add_argument('--self_learning', action='store_true', help='enable self-learning')
     self_learning_group.add_argument('--vocabulary_cutoff', type=int, default=0, help='restrict the vocabulary to the top k entries')
@@ -118,6 +117,7 @@ def main():
     self_learning_group.add_argument('-v', '--verbose', action='store_true', help='write log information to stderr at each iteration')
     args = parser.parse_args()
 
+    # pre-setting groups
     if args.supervised is not None:
         parser.set_defaults(init_dictionary=args.supervised, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', batch_size=1000)
     if args.semi_supervised is not None:
@@ -129,14 +129,6 @@ def main():
         parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', self_learning=True, vocabulary_cutoff=20000, csls_neighborhood=10, max_align=2, align_weight='rr')
     if args.unsupervised or args.acl2018:
         parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', self_learning=True, vocabulary_cutoff=20000, csls_neighborhood=10)
-    if args.aaai2018:
-        parser.set_defaults(init_dictionary=args.aaai2018, normalize=['unit', 'center'], whiten=True, trg_reweight=1, src_dewhiten='src', trg_dewhiten='trg', batch_size=1000)
-    if args.acl2017:
-        parser.set_defaults(init_numerals=True, orthogonal=True, normalize=['unit', 'center'], self_learning=True, direction='forward', stochastic_initial=1.0, stochastic_interval=1, batch_size=1000)
-    if args.acl2017_seed:
-        parser.set_defaults(init_dictionary=args.acl2017_seed, orthogonal=True, normalize=['unit', 'center'], self_learning=True, direction='forward', stochastic_initial=1.0, stochastic_interval=1, batch_size=1000)
-    if args.emnlp2016:
-        parser.set_defaults(init_dictionary=args.emnlp2016, orthogonal=True, normalize=['unit', 'center'], batch_size=1000)
     args = parser.parse_args()
 
     # Check command line arguments
@@ -146,7 +138,7 @@ def main():
 
     # Choose the right dtype for the desired precision
     if args.precision == 'fp16':
-        dtype = 'float16'
+        dtype = 'float16'  # many operations not supported by cupy
     elif args.precision == 'fp32':
         dtype = 'float32'
     elif args.precision == 'fp64':
@@ -159,7 +151,15 @@ def main():
     src_words, x = embeddings.read(srcfile, dtype=dtype)
     trg_words, z = embeddings.read(trgfile, dtype=dtype)
     print('embeddings read')
-
+    
+    # Read input source sense mapping
+    print('reading sense mapping')
+    src_senses = pickle.load(open(args.sense_input, 'rb'))
+    if src_senses.shape[0] != x.shape[0]:
+        src_senses = csr_matrix(src_senses.transpose())
+    src_senses = get_sparse_module(src_senses)
+    print(f'source sense mapping of shape {src_senses.shape} loaded')
+    
     # NumPy/CuPy management
     if args.cuda:
         if not supports_cupy():
@@ -188,6 +188,7 @@ def main():
     src_indices = []
     trg_indices = []
     if args.init_unsupervised:
+        # default, with unsupervised_vocab = top 4k aligned words
         sim_size = min(x.shape[0], z.shape[0]) if args.unsupervised_vocab <= 0 else min(x.shape[0], z.shape[0], args.unsupervised_vocab)
         u, s, vt = xp.linalg.svd(x[:sim_size], full_matrices=False)
         xsim = (u*s).dot(u.T)
@@ -267,29 +268,55 @@ def main():
         log = open(args.log, mode='w', encoding=args.encoding, errors='surrogateescape')
         print(f'logging into {args.log}')
 
-    # Allocate memory
+    ### Allocate memory ###
+    # W matrices
     xw = xp.empty_like(x)
     zw = xp.empty_like(z)
     src_size = x.shape[0] if args.vocabulary_cutoff <= 0 else min(x.shape[0], args.vocabulary_cutoff)
     trg_size = z.shape[0] if args.vocabulary_cutoff <= 0 else min(z.shape[0], args.vocabulary_cutoff)
+    
+    emb_dim = x.shape[1]
+    sense_size = src_senses.shape[1]
+    
+    ### TODO initialize using seed dictionary
+    trg_senses = get_sparse_module(csr_matrix((trg_size, sense_size)))
+    
+    # sense embeddings and alignments
+    # src_s_size * sdim embedding table (\tilde{E}^h)
+    if args.sense_init == 'glorot':
+        sx = xp.random.rand(sense_size, emb_dim)*xp.sqrt(1/(sense_size+emb_dim))
+        sz = xp.random.rand(sense_size, emb_dim)*xp.sqrt(1/(sense_size+emb_dim))
+    else:
+        sx = xp.empty((sense_size, emb_dim), dtype=dtype)
+        sz = xp.empty((sense_size, emb_dim), dtype=dtype)
+    
+    ### TODO these could be svd'd? Do these replace xw, zw?
+    ccx = xp.empty_like(x)  # temp for least-squares calc
+    ccz = xp.empty_like(z)  # temp for least-squares calc
+    
+    # similarities for ranking
     simfwd = xp.empty((min(src_size, args.batch_size), trg_size), dtype=dtype)
     simbwd = xp.empty((min(trg_size, args.batch_size), src_size), dtype=dtype)
-    #argsimsf = xp.empty((min(src_size, args.batch_size), args.max_align), dtype=int)
-    #argsimsb = xp.empty((min(trg_size, args.batch_size), args.max_align), dtype=int)
+    xr = xp.zeros(((src_size+trg_size) * args.max_align, x.shape[1]), dtype=dtype)  # assumes "both" param
+    zr = xp.zeros(((src_size+trg_size) * args.max_align, z.shape[1]), dtype=dtype)  # assumes "both" param
+    
+    # similarity weight coefficients
+    all_coefs = xp.zeros(((src_size+trg_size) * args.max_align, 1), dtype=dtype)
+    
+    # top-ranked similarities
     argsimsf = xp.empty((min(src_size, args.batch_size), 1), dtype=int)
     argsimsb = xp.empty((min(trg_size, args.batch_size), 1), dtype=int)
     if args.validation is not None:
         simval = xp.empty((len(validation.keys()), z.shape[0]), dtype=dtype)
-
     best_sim_forward = xp.full(src_size, -100, dtype=dtype)
+
+    # nonzero elements in dictionaries
     src_indices_forward = xp.array(list(range(src_size)) * args.max_align)
     trg_indices_forward = xp.zeros(src_size * args.max_align, dtype=int)
     best_sim_backward = xp.full(trg_size, -100, dtype=dtype)
     src_indices_backward = xp.zeros(trg_size * args.max_align, dtype=int)
     trg_indices_backward = xp.array(list(range(trg_size)) * args.max_align)
-    xr = xp.zeros(((src_size+trg_size) * args.max_align, x.shape[1]), dtype=dtype)  # assumes "both" param
-    zr = xp.zeros(((src_size+trg_size) * args.max_align, z.shape[1]), dtype=dtype)  # assumes "both" param
-    all_coefs = xp.zeros(((src_size+trg_size) * args.max_align, 1), dtype=dtype)
+    
     knn_sim_fwd = xp.zeros(src_size, dtype=dtype)
     knn_sim_bwd = xp.zeros(trg_size, dtype=dtype)
 
@@ -312,17 +339,34 @@ def main():
             keep_prob = min(1.0, args.stochastic_multiplier*keep_prob)
             last_improvement = it
             
-        ### UNDER CONSTRUCTION - SENSE EMBEDDING PHASE ###  
+        ### UNDER CONSTRUCTION - SENSE EMBEDDING PHASE ### 
+        ### TODO move to appropriate location? Replace dictionary learning?
         
-        # sdh is a *fixed* src_size * src_s_size sparse matrix (S^h in paper)
+        # src_senses is a *fixed* src_size * src_s_size sparse matrix (S^h in paper)
         # sx is a src_s_size * sdim embedding table (\tilde{E}^h)
-        # sy is a src_s_size * sdim embedding table (\tilde{E}^l)
-        # lambda is a regularization hyperparam
+        # sz is a src_s_size * sdim embedding table (\tilde{E}^l)
+        # lamb is a regularization hyperparam from input
         
-        ccx = xw - sdh.dot(sy) # Y in eq. (10)
-        del_sx = xp.linalg.inv(sdh.dot(sdh.transpose())+(xp.identity(src_size)*(1./lambda)))\
-                    .dot(sdh.transpose()).dot(ccx) # eq. (11)
-            
+        ccx = xw - src_senses.dot(sz)  # Y in eq. (10), shape = src_size * dim
+        del_sx_1 = xp.linalg.inv(src_senses.dot(src_senses.transpose())+(xp.identity(src_size)*(1./args.lamb)))  # shape = src_size * src_size PROBLEM
+        del_sx_2 = src_senses.transpose().dot(del_sx_1)  # changed order here for cupy reasons, might want to change back
+        del_sx = del_sx_2.dot(ccx)  # eq. (11)
+        sx[:] = sz + del_sx
+        
+        ccz = zw - trg_senses.dot(sx)  # Y in eq. (10) but for target, shape = trg_size * dim
+        del_sz_1 = xp.linalg.inv(trg_senses.dot(trg_senses.transpose())+(xp.identity(trg_size)*(1./args.lamb)))  # shape = trg_size * trg_size PROBLEM
+        del_sz_2 = trg_senses.transpose().dot(del_sz_1)  # changed order here for cupy reasons, might want to change back
+        del_sz = del_sz_2.dot(ccz)  # eq. (11)
+        sz[:] = sx + del_sz
+        
+        ### OLD FORM - might still be true
+        #ccz = zw - trg_senses.dot(sx) # Y in eq. (10) but for target
+        #del_sz = xp.linalg.inv(trg_senses.dot(trg_senses.transpose())+(xp.identity(trg_size)*(1./args.lamb)))\
+        #            .dot(trg_senses.transpose()).dot(ccz)  # eq. (11) but for target
+        #sz[:] = sx + del_sz
+        
+        ### TODO missing trg_senses optimization phase (S^l in paper; src_senses is fixed)
+        
         ### END CONSTRUCTION - SENSE EMBEDDING PHASE ###
 
         # Update the embedding mapping (only affecting vectors that have dictionary mappings)
@@ -351,11 +395,6 @@ def main():
                     xr = x[src_indices] * all_coefs
                     u, s, vt = xp.linalg.svd(zr.T.dot(xr))
             w = vt.T.dot(u.T)
-            x.dot(w, out=xw)
-            zw[:] = z
-        elif args.unconstrained:  # unconstrained mapping
-            x_pseudoinv = xp.linalg.inv(x[src_indices].T.dot(x[src_indices])).dot(x[src_indices].T)
-            w = x_pseudoinv.dot(z[trg_indices])
             x.dot(w, out=xw)
             zw[:] = z
         else:  # advanced mapping (default for end, acl2018)
@@ -425,12 +464,10 @@ def main():
                     simfwd[:j-i] -= knn_sim_bwd/2  # Equivalent to the real CSLS scores for NN
                     
                     # softmaxing
-                    #argsimsf[:] = dropout(-simfwd[:j-i], 1 - keep_prob).argsort(axis=1)[:,:args.max_align]
                     for k in range(args.max_align):
                         argsimsf = dropout(simfwd[:j-i], 1 - keep_prob).argmax(axis=1)
                         simfwd[:j-i,argsimsf] = -200
                         trg_indices_forward[(k*src_size)+i:(k*src_size)+j] = argsimsf
-                        #trg_indices_forward[(k*src_size)+i:(k*src_size)+j] = argsimsf[:,k]
             if args.direction in ('backward', 'union'):
                 if args.csls_neighborhood > 0:
                     for i in range(0, src_size, simfwd.shape[0]):
@@ -444,12 +481,10 @@ def main():
                     simbwd[:j-i] -= knn_sim_fwd/2  # Equivalent to the real CSLS scores for NN
                     
                     # softmaxing
-                    #argsimsb[:] = dropout(-simbwd[:j-i], 1 - keep_prob).argsort(axis=1)[:,:args.max_align]
                     for k in range(args.max_align):
                         argsimsb = dropout(simbwd[:j-i], 1 - keep_prob).argmax(axis=1)
                         simbwd[:j-i,argsimsb] = -200
                         trg_indices_backward[(k*trg_size)+i:(k*trg_size)+j] = argsimsb
-                        #src_indices_backward[(k*trg_size)+i:(k*trg_size)+j] = argsimsb[:,k]
             if args.direction == 'forward':
                 src_indices = src_indices_forward
                 trg_indices = trg_indices_forward
