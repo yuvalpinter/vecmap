@@ -15,6 +15,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import numpy
+from scipy.sparse import csr_matrix
 
 try:
     import cupy
@@ -37,6 +38,13 @@ def get_array_module(x):
         return numpy
 
 
+def get_sparse_module(x):
+    if cupy is not None:
+        return cupy.sparse.csr_matrix(x.astype('float32'))
+    else:
+        return csr_matrix(x)
+
+        
 def asnumpy(x):
     if cupy is not None:
         return cupy.asnumpy(x)
