@@ -24,7 +24,8 @@ import re
 import sys
 import time
 import pickle
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, identity
+from scipy.sparse.linalg import inv
 
 
 def dropout(m, p):
@@ -139,7 +140,7 @@ def main():
     # Choose the right dtype for the desired precision
     if args.precision == 'fp16':
         dtype = 'float16'  # many operations not supported by cupy
-    elif args.precision == 'fp32':
+    elif args.precision == 'fp32':  # default
         dtype = 'float32'
     elif args.precision == 'fp64':
         dtype = 'float64'
@@ -157,7 +158,7 @@ def main():
     src_senses = pickle.load(open(args.sense_input, 'rb'))
     if src_senses.shape[0] != x.shape[0]:
         src_senses = csr_matrix(src_senses.transpose())
-    src_senses = get_sparse_module(src_senses)
+    #src_senses = get_sparse_module(src_senses)  # CUDA, might not be needed
     print(f'source sense mapping of shape {src_senses.shape} loaded')
     
     # NumPy/CuPy management
@@ -279,7 +280,8 @@ def main():
     sense_size = src_senses.shape[1]
     
     ### TODO initialize using seed dictionary
-    trg_senses = get_sparse_module(csr_matrix((trg_size, sense_size)))
+    #trg_senses = get_sparse_module(csr_matrix((trg_size, sense_size)))
+    trg_senses = csr_matrix((trg_size, sense_size))
     
     # sense embeddings and alignments
     # src_s_size * sdim embedding table (\tilde{E}^h)
@@ -347,16 +349,31 @@ def main():
         # sz is a src_s_size * sdim embedding table (\tilde{E}^l)
         # lamb is a regularization hyperparam from input
         
-        ccx = xw - src_senses.dot(sz)  # Y in eq. (10), shape = src_size * dim
-        del_sx_1 = xp.linalg.inv(src_senses.dot(src_senses.transpose())+(xp.identity(src_size)*(1./args.lamb)))  # shape = src_size * src_size PROBLEM
-        del_sx_2 = src_senses.transpose().dot(del_sx_1)  # changed order here for cupy reasons, might want to change back
+        # source sense embeddings
+        ### TODO everything until del_sx_2 here can be extracted since src_senses is fixed
+        # inverse operation for sparse matrices doesn't seem to exist in cupy
+        src_eye = identity(src_size, dtype=dtype) * (1./args.lamb)  # for cuda, call get_sparse_module()
+        trg_eye = identity(trg_size, dtype=dtype) * (1./args.lamb)  # for cuda, call get_sparse_module()
+        del_sx_1 = inv(src_senses.dot(src_senses.transpose()) + src_eye)  # if cuda, add .get() to inv param
+        del_sx_1 = get_sparse_module(del_sx_1)  # shape: src_size * src_size
+        del_sx_2 = get_sparse_module(src_senses.transpose()).dot(del_sx_1)  # changed order here for cupy reasons
+        #del_sx_2 = del_sx_1.dot(get_sparse_module(src_senses))  # unchanged order here for cupy reasons
+        
+        ### TODO this was fine(ish) - figure out
+        ccx = xw - (get_sparse_module(src_senses).dot(sz))  # Y in eq. (10), shape = src_size * dim
         del_sx = del_sx_2.dot(ccx)  # eq. (11)
+        #del_sx_3 = get_sparse_module(src_senses.transpose()).dot(ccx) (and comment out del_sx_2 lines)
+        #del_sx = del_sx_1.dot(del_sx_3)
         sx[:] = sz + del_sx
         
-        ccz = zw - trg_senses.dot(sx)  # Y in eq. (10) but for target, shape = trg_size * dim
-        del_sz_1 = xp.linalg.inv(trg_senses.dot(trg_senses.transpose())+(xp.identity(trg_size)*(1./args.lamb)))  # shape = trg_size * trg_size PROBLEM
-        del_sz_2 = trg_senses.transpose().dot(del_sz_1)  # changed order here for cupy reasons, might want to change back
-        del_sz = del_sz_2.dot(ccz)  # eq. (11)
+        # target sense embeddings
+        del_sz_1 = inv(trg_senses.dot(trg_senses.transpose()) + trg_eye)  # if cuda, add .get() to inv param
+        del_sz_1 = get_sparse_module(del_sz_1)
+        del_sz_2 = get_sparse_module(trg_senses.transpose()).dot(del_sz_1)  # changed order here for cupy reasons
+        
+        ccz = zw - (get_sparse_module(trg_senses).dot(sx))  # Y in eq. (10) but for target, shape = trg_size * dim
+        #del_sz_1 = xp.linalg.inv(trg_senses.dot(trg_senses.transpose())+(xp.identity(trg_size)*(1./args.lamb)))  # shape = trg_size * trg_size PROBLEM
+        del_sz = del_sz_2.dot(ccz)  # eq. (11) but for target
         sz[:] = sx + del_sz
         
         ### OLD FORM - might still be true
@@ -365,7 +382,7 @@ def main():
         #            .dot(trg_senses.transpose()).dot(ccz)  # eq. (11) but for target
         #sz[:] = sx + del_sz
         
-        ### TODO missing trg_senses optimization phase (S^l in paper; src_senses is fixed)
+        ### TODO trg_senses optimization phase (S^l in paper; src_senses is fixed)
         
         ### END CONSTRUCTION - SENSE EMBEDDING PHASE ###
 

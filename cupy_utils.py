@@ -38,9 +38,9 @@ def get_array_module(x):
         return numpy
 
 
-def get_sparse_module(x):
+def get_sparse_module(x, dtype='float32'):
     if cupy is not None:
-        return cupy.sparse.csr_matrix(x.astype('float32'))
+        return cupy.sparse.csr_matrix(x.astype(dtype))
     else:
         return csr_matrix(x)
 
