@@ -26,6 +26,8 @@ import time
 import pickle
 from scipy.sparse import csr_matrix, identity, vstack
 from scipy.sparse.linalg import inv
+from sklearn.linear_model import Lasso
+from sklearn.decomposition import sparse_encode
 
 
 def dropout(m, p):
@@ -62,7 +64,8 @@ def psinv(matr:csr_matrix, dtype, reg=0.):
         regm = csr_matrix((regsize, regsize))
     else:
         regm = identity(regsize, dtype=dtype) * (1./reg)  # if direct cuda, call get_sparse_module()
-    return get_sparse_module(inv(matr.transpose().dot(matr) + regm))  # if direct cuda, add .get() to inv param
+    toinv = matr.transpose().dot(matr) + regm
+    return get_sparse_module(inv(toinv))  # if direct cuda, add .get() to inv param
 
 
 def main():
@@ -84,6 +87,7 @@ def main():
     recommended_type = recommended_group.add_mutually_exclusive_group()
     recommended_type.add_argument('--unsupervised', action='store_true', help='recommended if you have no seed dictionary and do not want to rely on identical words')
     recommended_type.add_argument('--future', action='store_true', help='experiment with stuff')
+    recommended_type.add_argument('--toy', action='store_true', help='experiment with stuff on toy dataset')
     recommended_type.add_argument('--acl2018', action='store_true', help='reproduce our ACL 2018 system')
 
     init_group = parser.add_argument_group('advanced initialization arguments', 'Advanced initialization arguments')
@@ -110,16 +114,21 @@ def main():
     self_learning_group.add_argument('--stochastic_multiplier', default=2.0, type=float, help='stochastic dictionary induction multiplier (defaults to 2.0)')
     self_learning_group.add_argument('--stochastic_interval', default=50, type=int, help='stochastic dictionary induction interval (defaults to 50)')
     self_learning_group.add_argument('--log', default='map.log', help='write to a log file in tsv format at each iteration')
+    self_learning_group.add_argument('-v', '--verbose', action='store_true', help='write log information to stderr at each iteration')
     
     future_group = parser.add_argument_group('experimental arguments', 'Experimental arguments')
+    future_group.add_argument('--trim_senses', action='store_true', help='Trim sense table to working vocab')
     future_group.add_argument('--lamb', type=float, default=0.5, help='Weight hyperparameter for sense alignment objectives')
-    future_group.add_argument('--reglamb', type=float, default=0.01, help='Lasso regularization hyperparameter')
+    future_group.add_argument('--reglamb', type=float, default=1., help='Lasso regularization hyperparameter')
+    future_group.add_argument('--inv_delta', type=float, default=0.0001, help='Delta_I added for inverting sense matrix')
     
     args = parser.parse_args()
 
-    # pre-setting groups    
+    # pre-setting groups
+    if args.toy:
+        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=50, csls_neighborhood=10, trim_senses=True, inv_delta=1., reglamb=0.2)
     if args.unsupervised or args.future:
-        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=20000, csls_neighborhood=10)
+        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=2000, csls_neighborhood=10, trim_senses=True)
     if args.unsupervised or args.acl2018:
         parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=20000, csls_neighborhood=10)
     args = parser.parse_args()
@@ -151,7 +160,7 @@ def main():
     if src_senses.shape[0] != x.shape[0]:
         src_senses = csr_matrix(src_senses.transpose())  # using non-cuda scipy because of 'inv' impl
     #src_senses = get_sparse_module(src_senses)
-    print(f'source sense mapping of shape {src_senses.shape} loaded')
+    print(f'source sense mapping of shape {src_senses.shape} loaded with {src_senses.getnnz()} nonzeros')
     
     # NumPy/CuPy management
     if args.cuda:
@@ -183,6 +192,7 @@ def main():
         print(f'logging into {args.log}')    
 
     # Allocate memory
+    #lasso_model = Lasso(alpha=args.reglamb, fit_intercept=False, max_iter=1, positive=True)  # TODO more parametrization
     
     # Initialize the projection matrices W(s) = W(t) = I.
     xw = xp.empty_like(x)
@@ -190,24 +200,30 @@ def main():
     xw[:] = x
     zw[:] = z
     
-    ### TODO remove? or, possibly, trim sense table?
     src_size = x.shape[0] if args.vocabulary_cutoff <= 0 else min(x.shape[0], args.vocabulary_cutoff)
     trg_size = z.shape[0] if args.vocabulary_cutoff <= 0 else min(z.shape[0], args.vocabulary_cutoff)
-    
     emb_dim = x.shape[1]
+    
+    if args.trim_senses:
+        # reshape sense assignment
+        src_senses = src_senses[:src_size]
+        colsums = src_senses.sum(axis=0).tolist()[0]
+        src_senses = src_senses[:,[i for i,j in enumerate(colsums) if j>0]]
+        print(f'trimmed sense dictionary dimensions: {src_senses.shape} with {src_senses.getnnz()} nonzeros')
     sense_size = src_senses.shape[1]
     
     # Initialize the concept embeddings from the source embeddings
     ### TODO maybe try gradient descent instead?
     ### TODO (pre-)create non-singular alignment matrix
     cc = xp.empty((sense_size, emb_dim))  # \tilde{E}
-    src_sns_psinv = psinv(src_senses, dtype, 0.001)  # will come in handy in iterations
-    xecc = x.T.dot(get_sparse_module(src_senses).toarray()).T  # sense_size * emb_dim
+    print('starting psinv calc')
+    src_sns_psinv = psinv(src_senses, dtype, args.inv_delta)  # will come in handy in iterations
+    xecc = x[:src_size].T.dot(get_sparse_module(src_senses).toarray()).T  # sense_size * emb_dim
     cc[:] = src_sns_psinv.dot(xecc)
-        
+    
     ### TODO initialize trg_senses using seed dictionary instead?
-    #trg_senses = csr_matrix((trg_size, sense_size))  # uncomment if trimming src_senses
-    trg_senses = csr_matrix((z.shape[0], sense_size))  # using non-cuda scipy because of 'inv' impl
+    trg_sns_size = trg_size if args.trim_senses else z.shape[0]
+    trg_senses = csr_matrix((trg_sns_size, sense_size))  # using non-cuda scipy because of 'inv' impl
     ccz = xp.empty_like(z)  # temp for trg_senses calculation
     zecc = xp.empty_like(xecc)  # sense_size * emb_dim
     
@@ -223,7 +239,7 @@ def main():
     print('starting training')
     while True:
         if it % 50 == 0:
-            print(f'starting iteration {it}')
+            print(f'starting iteration {it}, last objective was {objective}')
 
         # Increase the keep probability if we have not improved in args.stochastic_interval iterations
         if it - last_improvement > args.stochastic_interval:
@@ -232,16 +248,43 @@ def main():
             keep_prob = min(1.0, args.stochastic_multiplier*keep_prob)
             last_improvement = it
             
-        ### TODO update target assignments (6) - lasso regression
+        ### update target assignments (6) - lasso regression
         # write to trg_senses (which should be sparse)
         # optimize: 0.5 * (xp.linalg.norm(zw[i] - trg_senses[i].dot(cc))^2) + (opts.reglamb * xp.linalg.norm(trg_senses[i],1))
         #print(zw[0] - (get_sparse_module(trg_senses[0]).dot(cc)))  # 1 * emb_dim
         
+        # sparse_encode (not working on 20K vocab - "Killed"; ok on 2K)
+        # n_samples === trg_sns_size; n_components === sense_size; n_features === emb_dim
+        sparseX = zw[:trg_size].get() # trg_sns_size, emb_dim
+        sparseD = cc.get() # sense_size, emb_dim TODO possibly pre-normalize
+        trg_senses = csr_matrix(sparse_encode(sparseX, sparseD, alpha=args.reglamb, max_iter=100, positive=True))
+        
+        # lasso
+        #trgsnss = []
+        #cccpu = cc.get().T  # emb_dim * sense_size
+        
+        # parallel lasso (not working)
+        #lasso_model.fit(cccpu, zw[:trg_size].get())
+        #print(type(lasso_model.sparse_coef_), lasso_model.sparse_coef_.shape)
+        #trg_senses = csr_matrix(lasso_model.coef_)
+        
+        # non-parallel lasso
+        #for i in range(trg_senses.shape[0]):
+        #    ### TODO PARALLELIZE
+        #    if (i+1) % 10000 == 0:
+        #        print(f'finished {i+1} lasso steps')
+        #    lasso_model.fit(cccpu, zw[i].get())
+        #    trgsnss.append(csr_matrix(lasso_model.coef_))
+        #trg_senses = vstack(trgsnss)
+        
+        if trg_senses.getnnz() > 0:
+            print(f'finished target sense mapping step with {trg_senses.getnnz()} nonzeros.')
+        
         ### update synset embeddings (9)
-        ### TODO probably no memory for this
         all_senses = vstack((src_senses, trg_senses), format='csr')
-        all_sns_psinv = psinv(all_senses, dtype, 0.001)
-        xzecc = xp.concatenate((xw, zw)).T.dot(get_sparse_module(all_senses).toarray()).T  # sense_size * emb_dim
+        all_sns_psinv = psinv(all_senses, dtype, args.inv_delta)
+        xzecc = xp.concatenate((xw[:src_size], zw[:trg_size])).T\
+                    .dot(get_sparse_module(all_senses).toarray()).T  # sense_size * emb_dim
         cc[:] = all_sns_psinv.dot(xzecc)
         
         ### update projections (3,5)
@@ -252,13 +295,13 @@ def main():
             wx = vt.T.dot(u.T).astype(dtype)
             x.dot(wx, out=xw)
             
-            zecc = z.T.dot(get_sparse_module(trg_senses).toarray()).T
+            zecc = z[:trg_size].T.dot(get_sparse_module(trg_senses).toarray()).T
             u, s, vt = xp.linalg.svd(cc.T.dot(zecc))
             wz = vt.T.dot(u.T).astype(dtype)
             z.dot(wz, out=zw)
             
         else:  # advanced mapping
-            pass ### TODO strip for parts
+            break ### TODO strip for parts
 
             # remove lower-rank transformations
             midpoint = src_size * args.max_align
@@ -272,7 +315,6 @@ def main():
             ### TODO entry point for adding more matrix operations ###
 
             # STEP 1: Whitening
-            ### TODO figure out how weighted k-best affects this (and onwards) ###
             def whitening_transformation(m):
                 u, s, vt = xp.linalg.svd(m, full_matrices=False)
                 return vt.T.dot(xp.diag(1/s)).dot(vt)
@@ -351,7 +393,12 @@ def main():
 
             ### TODO compute the objective, check against a stopping condition 
             # Objective function evaluation
-            objective = (xp.mean(best_sim_forward) + xp.mean(best_sim_backward)).tolist() / 2
+            objective = (xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')\
+                            + xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) / 2 \
+                        + args.reglamb * trg_senses.sum()  # TODO consider thresholding reg part
+            objective = float(objective)
+            ### TODO create bilingual dictionary?
+            
             if objective - best_objective >= args.threshold:
                 last_improvement = it
                 best_objective = objective
@@ -369,9 +416,7 @@ def main():
                     print('\t- Val. coverage:    {0:9.4f}%'.format(100 * validation_coverage), file=sys.stderr)
                 sys.stderr.flush()
             if args.log is not None:
-                val = '{0:.6f}\t{1:.6f}\t{2:.6f}'.format(
-                    100 * similarity, 100 * accuracy, 100 * validation_coverage) if args.validation is not None else ''
-                print('{0}\t{1:.6f}\t{2}\t{3:.6f}'.format(it, 100 * objective, val, duration), file=log)
+                print('{0}\t{1:.6f}\t{2:.6f}'.format(it, 100 * objective, duration), file=log)
                 log.flush()
 
         t = time.time()
