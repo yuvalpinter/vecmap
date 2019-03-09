@@ -24,8 +24,8 @@ import re
 import sys
 import time
 import pickle
-from scipy.sparse import csr_matrix, identity, vstack
-from scipy.sparse.linalg import inv
+from scipy.sparse import csr_matrix, csc_matrix, identity, vstack, hstack
+from scipy.sparse.linalg import inv, cg
 from sklearn.linear_model import Lasso
 from sklearn.decomposition import sparse_encode
 
@@ -58,6 +58,13 @@ def topk_mean(m, k, inplace=False):  # TODO Assuming that axis is 1
 
     
 def psinv(matr:csr_matrix, dtype, reg=0.):
+    regsize = matr.shape[1]
+    toinv = matr.transpose().dot(matr)
+    fullid = identity(regsize)
+    return get_sparse_module(vstack([csr_matrix(cg(toinv, fullid.getrow(i).transpose().toarray())[0]) \
+                                    for i in range(regsize)]))
+    
+def psinv2(matr:csr_matrix, dtype, reg=0.):
     # inverse operation for sparse matrices doesn't seem to exist in cupy
     regsize = matr.shape[1]
     if reg == 0:
@@ -121,12 +128,13 @@ def main():
     future_group.add_argument('--lamb', type=float, default=0.5, help='Weight hyperparameter for sense alignment objectives')
     future_group.add_argument('--reglamb', type=float, default=1., help='Lasso regularization hyperparameter')
     future_group.add_argument('--inv_delta', type=float, default=0.0001, help='Delta_I added for inverting sense matrix')
+    future_group.add_argument('--lasso_iters', type=int, default=10, help='Number of iterations for LASSO/NMF')
     
     args = parser.parse_args()
 
     # pre-setting groups
     if args.toy:
-        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=50, csls_neighborhood=10, trim_senses=True, inv_delta=1., reglamb=0.2)
+        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=50, csls_neighborhood=10, trim_senses=True, inv_delta=1., reglamb=0.2, lasso_iters=100)
     if args.unsupervised or args.future:
         parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=2000, csls_neighborhood=10, trim_senses=True)
     if args.unsupervised or args.acl2018:
@@ -192,7 +200,6 @@ def main():
         print(f'logging into {args.log}')    
 
     # Allocate memory
-    #lasso_model = Lasso(alpha=args.reglamb, fit_intercept=False, max_iter=1, positive=True)  # TODO more parametrization
     
     # Initialize the projection matrices W(s) = W(t) = I.
     xw = xp.empty_like(x)
@@ -207,8 +214,13 @@ def main():
     if args.trim_senses:
         # reshape sense assignment
         src_senses = src_senses[:src_size]
+        # new columns for words with no senses in original input
+        ### TODO might also need this if not trimming (probably kinda far away)
+        newcols = [csc_matrix(([1],([i],[0])),shape=(src_size,1)) for i in range(src_size)\
+                   if src_senses.getrow(i).getnnz() == 0]
+        # trim senses no longer used, add new ones
         colsums = src_senses.sum(axis=0).tolist()[0]
-        src_senses = src_senses[:,[i for i,j in enumerate(colsums) if j>0]]
+        src_senses = hstack([src_senses[:,[i for i,j in enumerate(colsums) if j>0]]] + newcols)
         print(f'trimmed sense dictionary dimensions: {src_senses.shape} with {src_senses.getnnz()} nonzeros')
     sense_size = src_senses.shape[1]
     
@@ -217,9 +229,11 @@ def main():
     ### TODO (pre-)create non-singular alignment matrix
     cc = xp.empty((sense_size, emb_dim))  # \tilde{E}
     print('starting psinv calc')
-    src_sns_psinv = psinv(src_senses, dtype, args.inv_delta)  # will come in handy in iterations
+    t01 = time.time()
+    src_sns_psinv = psinv(src_senses, dtype, args.inv_delta)
     xecc = x[:src_size].T.dot(get_sparse_module(src_senses).toarray()).T  # sense_size * emb_dim
     cc[:] = src_sns_psinv.dot(xecc)
+    print(f'calculated psinv in {time.time()-t01:.2f} seconds', file=sys.stderr)
     
     ### TODO initialize trg_senses using seed dictionary instead?
     trg_sns_size = trg_size if args.trim_senses else z.shape[0]
@@ -230,7 +244,15 @@ def main():
     # removed similarities memory assignment
 
     # Training loop
-    best_objective = objective = -100.
+    lasso_model = Lasso(alpha=args.reglamb, fit_intercept=False, max_iter=args.lasso_iters, positive=True)  # TODO more parametrization
+    
+    if args.log is not None:
+        print(f'regularization: {args.reglamb}', file=log)
+        print(f'lasso iterations: {args.lasso_iters}', file=log)
+        print(f'inversion epsilon: {args.inv_delta}', file=log)
+        log.flush()
+    
+    best_objective = objective = 10000.
     it = 1
     last_improvement = 0
     keep_prob = args.stochastic_initial
@@ -249,56 +271,66 @@ def main():
             last_improvement = it
             
         ### update target assignments (6) - lasso regression
+        time6 = time.time()
         # write to trg_senses (which should be sparse)
         # optimize: 0.5 * (xp.linalg.norm(zw[i] - trg_senses[i].dot(cc))^2) + (opts.reglamb * xp.linalg.norm(trg_senses[i],1))
         #print(zw[0] - (get_sparse_module(trg_senses[0]).dot(cc)))  # 1 * emb_dim
         
         # sparse_encode (not working on 20K vocab - "Killed"; ok on 2K)
         # n_samples === trg_sns_size; n_components === sense_size; n_features === emb_dim
-        sparseX = zw[:trg_size].get() # trg_sns_size, emb_dim
-        sparseD = cc.get() # sense_size, emb_dim TODO possibly pre-normalize
-        trg_senses = csr_matrix(sparse_encode(sparseX, sparseD, alpha=args.reglamb, max_iter=100, positive=True))
+        #sparseX = zw[:trg_size].get() # trg_sns_size, emb_dim
+        #sparseD = cc.get() # sense_size, emb_dim TODO possibly pre-normalize
+        #trg_senses = csr_matrix(sparse_encode(sparseX, sparseD, alpha=args.reglamb, max_iter=args.lasso_iters, positive=True))
         
         # lasso
-        #trgsnss = []
-        #cccpu = cc.get().T  # emb_dim * sense_size
+        cccpu = cc.get().T  # emb_dim * sense_size
         
         # parallel lasso (not working)
-        #lasso_model.fit(cccpu, zw[:trg_size].get())
-        #print(type(lasso_model.sparse_coef_), lasso_model.sparse_coef_.shape)
-        #trg_senses = csr_matrix(lasso_model.coef_)
+        lasso_model.fit(cccpu, zw[:trg_size].get().T)
+        trg_senses = csr_matrix(lasso_model.coef_)
         
         # non-parallel lasso
+        #trgsnss = []
         #for i in range(trg_senses.shape[0]):
-        #    ### TODO PARALLELIZE
         #    if (i+1) % 10000 == 0:
         #        print(f'finished {i+1} lasso steps')
         #    lasso_model.fit(cccpu, zw[i].get())
         #    trgsnss.append(csr_matrix(lasso_model.coef_))
         #trg_senses = vstack(trgsnss)
         
-        if trg_senses.getnnz() > 0:
-            print(f'finished target sense mapping step with {trg_senses.getnnz()} nonzeros.')
+        if args.verbose:
+            print(f'sparse encoding step: {(time.time()-time6):.2f}', file=sys.stderr)
+            if trg_senses.getnnz() > 0:
+                print(f'finished target sense mapping step with {trg_senses.getnnz()} nonzeros.', file=sys.stderr)
         
         ### update synset embeddings (9)
+        time9 = time.time()
         all_senses = vstack((src_senses, trg_senses), format='csr')
         all_sns_psinv = psinv(all_senses, dtype, args.inv_delta)
         xzecc = xp.concatenate((xw[:src_size], zw[:trg_size])).T\
                     .dot(get_sparse_module(all_senses).toarray()).T  # sense_size * emb_dim
         cc[:] = all_sns_psinv.dot(xzecc)
+        if args.verbose:
+            print(f'synset embedding update: {time.time()-time9:.2f}', file=sys.stderr)
         
         ### update projections (3,5)
         # write to zw and xw
         # xecc is constant
         if args.orthogonal or not end:
+            time3 = time.time()
             u, s, vt = xp.linalg.svd(cc.T.dot(xecc))
             wx = vt.T.dot(u.T).astype(dtype)
             x.dot(wx, out=xw)
+            if args.verbose:
+                print(f'source projection update: {time.time()-time3:.2f}', file=sys.stderr)
             
+            time3 = time.time()
             zecc = z[:trg_size].T.dot(get_sparse_module(trg_senses).toarray()).T
             u, s, vt = xp.linalg.svd(cc.T.dot(zecc))
             wz = vt.T.dot(u.T).astype(dtype)
             z.dot(wz, out=zw)
+            if args.verbose:
+                print(f'target projection update: {time.time()-time3:.2f}', file=sys.stderr)
             
         else:  # advanced mapping
             break ### TODO strip for parts
@@ -393,30 +425,29 @@ def main():
 
             ### TODO compute the objective, check against a stopping condition 
             # Objective function evaluation
+            time_obj = time.time()
             objective = (xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')\
                             + xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) / 2 \
                         + args.reglamb * trg_senses.sum()  # TODO consider thresholding reg part
             objective = float(objective)
+            if args.verbose:
+                print(f'objective calculation: {time.time()-time_obj:.2f}', file=sys.stderr)  # 0.020 sec
             ### TODO create bilingual dictionary?
             
-            if objective - best_objective >= args.threshold:
+            if objective - best_objective <= -args.threshold:
                 last_improvement = it
                 best_objective = objective
 
             # Logging
             duration = time.time() - t
             if args.verbose:
-                print(file=sys.stderr)
                 print('ITERATION {0} ({1:.2f}s)'.format(it, duration), file=sys.stderr)
-                print('\t- Objective:        {0:9.4f}%'.format(100 * objective), file=sys.stderr)
+                print('\t- Objective:        {0:9.4f}'.format(objective), file=sys.stderr)
                 print('\t- Drop probability: {0:9.4f}%'.format(100 - 100*keep_prob), file=sys.stderr)
-                if args.validation is not None:
-                    print('\t- Val. similarity:  {0:9.4f}%'.format(100 * similarity), file=sys.stderr)
-                    print('\t- Val. accuracy:    {0:9.4f}%'.format(100 * accuracy), file=sys.stderr)
-                    print('\t- Val. coverage:    {0:9.4f}%'.format(100 * validation_coverage), file=sys.stderr)
+                print(file=sys.stderr)
                 sys.stderr.flush()
             if args.log is not None:
-                print('{0}\t{1:.6f}\t{2:.6f}'.format(it, 100 * objective, duration), file=log)
+                print(f'{it}\t{objective:.6f}\t{duration:.6f}\t{trg_senses.getnnz()}', file=log)
                 log.flush()
 
         t = time.time()
