@@ -24,7 +24,7 @@ import re
 import sys
 import time
 import pickle
-from scipy.sparse import csr_matrix, csc_matrix, identity, vstack, hstack
+from scipy.sparse import csr_matrix, csc_matrix, dia_matrix, identity, vstack, hstack
 from scipy.sparse.linalg import inv, cg
 from sklearn.linear_model import Lasso
 from sklearn.decomposition import sparse_encode
@@ -60,8 +60,9 @@ def topk_mean(m, k, inplace=False):  # TODO Assuming that axis is 1
 def psinv(matr:csr_matrix, dtype, reg=0.):
     regsize = matr.shape[1]
     toinv = matr.transpose().dot(matr)
+    precond = dia_matrix((1/(toinv.diagonal()),0),shape=(regsize,regsize))
     fullid = identity(regsize)
-    return get_sparse_module(vstack([csr_matrix(cg(toinv, fullid.getrow(i).transpose().toarray())[0]) \
+    return get_sparse_module(vstack([csr_matrix(cg(toinv, fullid.getrow(i).transpose().toarray(), maxiter=1, M=precond)[0]) \
                                     for i in range(regsize)]))
     
 def psinv2(matr:csr_matrix, dtype, reg=0.):
@@ -244,7 +245,8 @@ def main():
     # removed similarities memory assignment
 
     # Training loop
-    lasso_model = Lasso(alpha=args.reglamb, fit_intercept=False, max_iter=args.lasso_iters, positive=True)  # TODO more parametrization
+    lasso_model = Lasso(alpha=args.reglamb, fit_intercept=False, max_iter=args.lasso_iters,\
+                        positive=True, warm_start=True)  # TODO more parametrization
     
     if args.log is not None:
         print(f'regularization: {args.reglamb}', file=log)
@@ -285,7 +287,7 @@ def main():
         # lasso
         cccpu = cc.get().T  # emb_dim * sense_size
         
-        # parallel lasso (not working)
+        # parallel lasso
         lasso_model.fit(cccpu, zw[:trg_size].get().T)
         trg_senses = csr_matrix(lasso_model.coef_)
         
