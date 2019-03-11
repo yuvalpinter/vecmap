@@ -244,7 +244,7 @@ def main():
     if args.verbose:
         pseudo_id = src_senses.transpose().dot(src_senses).dot(src_sns_psinv.get())
         real_id = sparse_id(sense_size)
-        rel_diff = (pseudo_id-real_id).sum() / (src_senses*src_senses)
+        rel_diff = (pseudo_id-real_id).sum() / (sense_size*sense_size)
         print(f'per-coordinate pseudo-inverse distance from identity is {rel_diff:.5f}')
     
     ### TODO initialize trg_senses using seed dictionary instead?
@@ -310,6 +310,11 @@ def main():
             print(f'sparse encoding step: {(time.time()-time6):.2f}', file=sys.stderr)
             if trg_senses.getnnz() > 0:
                 print(f'finished target sense mapping step with {trg_senses.getnnz()} nonzeros.', file=sys.stderr)
+            objective = (xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')\
+                            + xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) / 2 \
+                        + args.reglamb * trg_senses.sum()  # TODO consider thresholding reg part
+            objective = float(objective)
+            print(f'objective: {objective:.3f}')
         
         time6b = time.time()
         # Write target sense mapping
@@ -330,6 +335,11 @@ def main():
         cc[:] = all_sns_psinv.dot(xzecc)
         if args.verbose:
             print(f'synset embedding update: {time.time()-time9:.2f}', file=sys.stderr)
+            objective = (xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')\
+                            + xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) / 2 \
+                        + args.reglamb * trg_senses.sum()  # TODO consider thresholding reg part
+            objective = float(objective)
+            print(f'objective: {objective:.3f}')
         
         ### update projections (3,5)
         # write to zw and xw
@@ -460,8 +470,8 @@ def main():
             duration = time.time() - t
             if args.verbose:
                 print('ITERATION {0} ({1:.2f}s)'.format(it, duration), file=sys.stderr)
-                print('\t- Objective:        {0:9.4f}'.format(objective), file=sys.stderr)
-                print('\t- Drop probability: {0:9.4f}%'.format(100 - 100*keep_prob), file=sys.stderr)
+                print('objective: {0:.3f}'.format(objective), file=sys.stderr)
+                print('drop probability: {0:.1f}%'.format(100 - 100*keep_prob), file=sys.stderr)
                 print(file=sys.stderr)
                 sys.stderr.flush()
             if args.log is not None:
