@@ -57,6 +57,10 @@ def topk_mean(m, k, inplace=False):  # TODO Assuming that axis is 1
     return ans / k
 
     
+def sparse_id(n):
+    return dia_matrix(([1]*n,0),shape=(n, n))
+
+
 def psinv(matr:csr_matrix, dtype, reg=0.):
     regsize = matr.shape[1]
     toinv = matr.transpose().dot(matr)
@@ -130,6 +134,8 @@ def main():
     future_group.add_argument('--reglamb', type=float, default=1., help='Lasso regularization hyperparameter')
     future_group.add_argument('--inv_delta', type=float, default=0.0001, help='Delta_I added for inverting sense matrix')
     future_group.add_argument('--lasso_iters', type=int, default=10, help='Number of iterations for LASSO/NMF')
+    future_group.add_argument('--iterations', type=int, default=-1, help='Number of overall model iterations')
+    future_group.add_argument('--gd', action='store_true', help='Apply gradient descent for assignment and synset embeddings')
     
     args = parser.parse_args()
 
@@ -234,7 +240,12 @@ def main():
     src_sns_psinv = psinv(src_senses, dtype, args.inv_delta)
     xecc = x[:src_size].T.dot(get_sparse_module(src_senses).toarray()).T  # sense_size * emb_dim
     cc[:] = src_sns_psinv.dot(xecc)
-    print(f'calculated psinv in {time.time()-t01:.2f} seconds', file=sys.stderr)
+    print(f'initialized concept embeddings in {time.time()-t01:.2f} seconds', file=sys.stderr)
+    if args.verbose:
+        pseudo_id = src_senses.transpose().dot(src_senses).dot(src_sns_psinv.get())
+        real_id = sparse_id(sense_size)
+        rel_diff = (pseudo_id-real_id).sum() / (src_senses*src_senses)
+        print(f'per-coordinate pseudo-inverse distance from identity is {rel_diff:.5f}')
     
     ### TODO initialize trg_senses using seed dictionary instead?
     trg_sns_size = trg_size if args.trim_senses else z.shape[0]
@@ -271,9 +282,15 @@ def main():
                 end = True
             keep_prob = min(1.0, args.stochastic_multiplier*keep_prob)
             last_improvement = it
+        
+        if args.iterations > 0 and it > args.iterations:
+            end=True
             
         ### update target assignments (6) - lasso regression
         time6 = time.time()
+        if args.gd:
+            raise NotImplementedError('Gradient Descent for target assignment still not implemented')
+            
         # write to trg_senses (which should be sparse)
         # optimize: 0.5 * (xp.linalg.norm(zw[i] - trg_senses[i].dot(cc))^2) + (opts.reglamb * xp.linalg.norm(trg_senses[i],1))
         #print(zw[0] - (get_sparse_module(trg_senses[0]).dot(cc)))  # 1 * emb_dim
@@ -284,31 +301,30 @@ def main():
         #sparseD = cc.get() # sense_size, emb_dim TODO possibly pre-normalize
         #trg_senses = csr_matrix(sparse_encode(sparseX, sparseD, alpha=args.reglamb, max_iter=args.lasso_iters, positive=True))
         
-        # lasso
+        # parallel LASSO (no cuda impl)
         cccpu = cc.get().T  # emb_dim * sense_size
-        
-        # parallel lasso
         lasso_model.fit(cccpu, zw[:trg_size].get().T)
-        trg_senses = csr_matrix(lasso_model.coef_)
-        
-        # non-parallel lasso
-        #trgsnss = []
-        #for i in range(trg_senses.shape[0]):
-        #    if (i+1) % 10000 == 0:
-        #        print(f'finished {i+1} lasso steps')
-        #    lasso_model.fit(cccpu, zw[i].get())
-        #    trgsnss.append(csr_matrix(lasso_model.coef_))
-        #trg_senses = vstack(trgsnss)
+        trg_senses = lasso_model.sparse_coef_
         
         if args.verbose:
             print(f'sparse encoding step: {(time.time()-time6):.2f}', file=sys.stderr)
             if trg_senses.getnnz() > 0:
                 print(f'finished target sense mapping step with {trg_senses.getnnz()} nonzeros.', file=sys.stderr)
         
+        time6b = time.time()
+        # Write target sense mapping
+        with open(args.tsns_output+f'-it{it:03d}', mode='wb') as tsnsfile:
+            pickle.dump(trg_senses, tsnsfile)
+        if args.verbose:
+            print(f'wrote target sense mapping: {(time.time()-time6b):.2f}', file=sys.stderr)
+        
         ### update synset embeddings (9)
         time9 = time.time()
+        if args.gd:
+            raise NotImplementedError('Gradient Descent for synset embeddings still not implemented')
+        
         all_senses = vstack((src_senses, trg_senses), format='csr')
-        all_sns_psinv = psinv(all_senses, dtype, args.inv_delta)
+        all_sns_psinv = psinv(all_senses, dtype, args.inv_delta)  ### TODO only update target side? We still have src_sns_psinv [it doesn't matter, dimensions are the same]
         xzecc = xp.concatenate((xw[:src_size], zw[:trg_size])).T\
                     .dot(get_sparse_module(all_senses).toarray()).T  # sense_size * emb_dim
         cc[:] = all_sns_psinv.dot(xzecc)
@@ -461,7 +477,7 @@ def main():
     with open(args.trg_output, mode='w', encoding=args.encoding, errors='surrogateescape') as trgfile:
         embeddings.write(trg_words, zw, trgfile)
     
-    # Write target sense embeddings
+    # Write target sense mapping
     with open(args.tsns_output, mode='wb') as tsnsfile:
         pickle.dump(trg_senses, tsnsfile)
 
