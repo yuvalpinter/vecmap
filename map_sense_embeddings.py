@@ -304,6 +304,7 @@ def main():
         # parallel LASSO (no cuda impl)
         cccpu = cc.get().T  # emb_dim * sense_size
         lasso_model.fit(cccpu, zw[:trg_size].get().T)
+        ### TODO maybe trim, keep only above some threshold (0.05) OR top f(#it)
         trg_senses = lasso_model.sparse_coef_
         
         if args.verbose:
