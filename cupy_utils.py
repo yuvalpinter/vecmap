@@ -15,12 +15,14 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import numpy
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix as cpu_sm
 
 try:
     import cupy
+    from cupy.sparse import csr_matrix as gpu_sm
 except ImportError:
     cupy = None
+    gpu_sm = None
 
 
 def supports_cupy():
@@ -40,9 +42,11 @@ def get_array_module(x):
 
 def get_sparse_module(x, dtype='float32'):
     if cupy is not None:
-        return cupy.sparse.csr_matrix(x.astype(dtype))
+        if type(x) == gpu_sm:
+            return x
+        return gpu_sm(x.astype(dtype))
     else:
-        return csr_matrix(x)
+        return cpu_sm(x)
 
         
 def asnumpy(x):

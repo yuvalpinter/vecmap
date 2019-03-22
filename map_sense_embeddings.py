@@ -16,6 +16,7 @@
 
 import embeddings
 from cupy_utils import *
+#from learning import SGD, Adam
 
 import argparse
 import collections
@@ -27,7 +28,6 @@ import pickle
 from scipy.sparse import csr_matrix, csc_matrix, dia_matrix, identity, vstack, hstack
 from scipy.sparse.linalg import inv, cg
 from sklearn.linear_model import Lasso
-from sklearn.decomposition import sparse_encode
 
 
 def dropout(m, p):
@@ -136,6 +136,7 @@ def main():
     future_group.add_argument('--lasso_iters', type=int, default=10, help='Number of iterations for LASSO/NMF')
     future_group.add_argument('--iterations', type=int, default=-1, help='Number of overall model iterations')
     future_group.add_argument('--gd', action='store_true', help='Apply gradient descent for assignment and synset embeddings')
+    future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD')
     
     args = parser.parse_args()
 
@@ -245,7 +246,7 @@ def main():
         pseudo_id = src_senses.transpose().dot(src_senses).dot(src_sns_psinv.get())
         real_id = sparse_id(sense_size)
         rel_diff = (pseudo_id-real_id).sum() / (sense_size*sense_size)
-        print(f'per-coordinate pseudo-inverse distance from identity is {rel_diff:.5f}')
+        print(f'per-coordinate pseudo-inverse precision is {rel_diff:.5f}')
     
     ### TODO initialize trg_senses using seed dictionary instead?
     trg_sns_size = trg_size if args.trim_senses else z.shape[0]
@@ -253,16 +254,29 @@ def main():
     ccz = xp.empty_like(z)  # temp for trg_senses calculation
     zecc = xp.empty_like(xecc)  # sense_size * emb_dim
     
+    if args.gd:
+        # everything can be done on gpu
+        src_senses = get_sparse_module(src_senses)
+        trg_senses = get_sparse_module(trg_senses)
+    
     # removed similarities memory assignment
 
     # Training loop
-    lasso_model = Lasso(alpha=args.reglamb, fit_intercept=False, max_iter=args.lasso_iters,\
-                        positive=True, warm_start=True)  # TODO more parametrization
+    if args.gd:
+        ### TODO not currently used
+        pass
+        #sgd_model = SGD(args.gd_lr)
+    else:
+        lasso_model = Lasso(alpha=args.reglamb, fit_intercept=False, max_iter=args.lasso_iters,\
+                            positive=True, warm_start=True)  # TODO more parametrization
     
     if args.log is not None:
-        print(f'regularization: {args.reglamb}', file=log)
-        print(f'lasso iterations: {args.lasso_iters}', file=log)
-        print(f'inversion epsilon: {args.inv_delta}', file=log)
+        if args.gd:
+            print(f'gradient descent lr: {args.gd_lr}', file=log)
+        else:
+            print(f'lasso regularization: {args.reglamb}', file=log)
+            print(f'lasso iterations: {args.lasso_iters}', file=log)
+            print(f'inversion epsilon: {args.inv_delta}', file=log)
         log.flush()
     
     best_objective = objective = 10000.
@@ -287,53 +301,56 @@ def main():
             end=True
             
         ### update target assignments (6) - lasso regression
-        time6 = time.time()
-        if args.gd:
-            raise NotImplementedError('Gradient Descent for target assignment still not implemented')
-            
+        time6 = time.time()            
         # write to trg_senses (which should be sparse)
         # optimize: 0.5 * (xp.linalg.norm(zw[i] - trg_senses[i].dot(cc))^2) + (opts.reglamb * xp.linalg.norm(trg_senses[i],1))
         #print(zw[0] - (get_sparse_module(trg_senses[0]).dot(cc)))  # 1 * emb_dim
         
-        # sparse_encode (not working on 20K vocab - "Killed"; ok on 2K)
-        # n_samples === trg_sns_size; n_components === sense_size; n_features === emb_dim
-        #sparseX = zw[:trg_size].get() # trg_sns_size, emb_dim
-        #sparseD = cc.get() # sense_size, emb_dim TODO possibly pre-normalize
-        #trg_senses = csr_matrix(sparse_encode(sparseX, sparseD, alpha=args.reglamb, max_iter=args.lasso_iters, positive=True))
-        
-        # parallel LASSO (no cuda impl)
-        cccpu = cc.get().T  # emb_dim * sense_size
-        lasso_model.fit(cccpu, zw[:trg_size].get().T)
-        ### TODO maybe trim, keep only above some threshold (0.05) OR top f(#it)
-        trg_senses = lasso_model.sparse_coef_
+        if args.gd:
+            ### TODO use sgd_model
+            ### TODO handle l1 condition
+            ### TODO handle sizes and/or threshold sparse matrix
+            # st <- st + 0.001 * (ew - st.dot(es)).dot(es.T)
+            tg_grad = (zw[:trg_size] - trg_senses.dot(cc)).dot(cc.T)
+            trg_senses += args.gd_lr * get_sparse_module(tg_grad) # memory exception (get_sparse_module)
+            
+        else:
+            # parallel LASSO (no cuda impl)
+            cccpu = cc.get().T  # emb_dim * sense_size
+            lasso_model.fit(cccpu, zw[:trg_size].get().T)
+            ### TODO maybe trim, keep only above some threshold (0.05) OR top f(#it)
+            trg_senses = lasso_model.sparse_coef_
         
         if args.verbose:
-            print(f'sparse encoding step: {(time.time()-time6):.2f}', file=sys.stderr)
-            if trg_senses.getnnz() > 0:
-                print(f'finished target sense mapping step with {trg_senses.getnnz()} nonzeros.', file=sys.stderr)
+            print(f'target sense mapping step: {(time.time()-time6):.2f}, {trg_senses.getnnz()} nonzeros', file=sys.stderr)
             objective = (xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')\
                             + xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) / 2 \
                         + args.reglamb * trg_senses.sum()  # TODO consider thresholding reg part
             objective = float(objective)
             print(f'objective: {objective:.3f}')
         
-        time6b = time.time()
-        # Write target sense mapping
+        # Write target sense mapping (no time issue)
         with open(args.tsns_output+f'-it{it:03d}', mode='wb') as tsnsfile:
             pickle.dump(trg_senses, tsnsfile)
-        if args.verbose:
-            print(f'wrote target sense mapping: {(time.time()-time6b):.2f}', file=sys.stderr)
         
         ### update synset embeddings (9)
         time9 = time.time()
         if args.gd:
-            raise NotImplementedError('Gradient Descent for synset embeddings still not implemented')
+            ### TODO use sgd_model
+            ### TODO probably handle sizes and/or threshold sparse matrix
+            ### TODO see if it's better to implement vstack over cupy alone, from:
+            ### https://github.com/scipy/scipy/blob/v1.2.1/scipy/sparse/construct.py#L468-L499
+            all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'))
+            cc_grad = all_senses.T.dot(xp.concatenate((xw[:src_size], zw[:trg_size])) - all_senses.dot(cc))
+            cc += args.gd_lr * cc_grad
         
-        all_senses = vstack((src_senses, trg_senses), format='csr')
-        all_sns_psinv = psinv(all_senses, dtype, args.inv_delta)  ### TODO only update target side? We still have src_sns_psinv [it doesn't matter, dimensions are the same]
-        xzecc = xp.concatenate((xw[:src_size], zw[:trg_size])).T\
-                    .dot(get_sparse_module(all_senses).toarray()).T  # sense_size * emb_dim
-        cc[:] = all_sns_psinv.dot(xzecc)
+        else:
+            all_senses = get_sparse_module(vstack((src_senses, trg_senses), format='csr'))
+            xzecc = xp.concatenate((xw[:src_size], zw[:trg_size])).T\
+                        .dot(all_senses.toarray()).T  # sense_size * emb_dim
+            all_sns_psinv = psinv(all_senses.get(), dtype, args.inv_delta)  ### TODO only update target side? We still have src_sns_psinv [it doesn't matter, dimensions are the same]
+            cc[:] = all_sns_psinv.dot(xzecc)
+            
         if args.verbose:
             print(f'synset embedding update: {time.time()-time9:.2f}', file=sys.stderr)
             objective = (xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')\
