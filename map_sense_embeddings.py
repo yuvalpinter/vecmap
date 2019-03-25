@@ -61,7 +61,7 @@ def sparse_id(n):
     return dia_matrix(([1]*n,0),shape=(n, n))
 
 
-def psinv(matr:csr_matrix, dtype, reg=0.):
+def psinv(matr, dtype, reg=0.):
     regsize = matr.shape[1]
     toinv = matr.transpose().dot(matr)
     precond = dia_matrix((1/(toinv.diagonal()),0),shape=(regsize,regsize))
@@ -79,6 +79,29 @@ def psinv2(matr:csr_matrix, dtype, reg=0.):
     toinv = matr.transpose().dot(matr) + regm
     return get_sparse_module(inv(toinv))  # if direct cuda, add .get() to inv param
 
+
+def trim_sparse(a, k, issparse=False):
+    '''
+    Return a sparse matrix with all but top k values zeros
+    TODO change k param to percentile since cupy doesn't have .quantile()
+    '''
+    if issparse:
+        if a.getnnz() <= k:
+            return a
+        kth_quant = 100 * (1. - (k / a.getnnz()))
+        xp = get_array_module(a.data)
+        kth = xp.percentile(a.data, kth_quant, interpolation='lower')
+        mask = a.data > kth
+        a.data = a.data * mask
+        a.eliminate_zeros()
+        return a
+    else:
+        xp = get_array_module(a)
+        kth_quant = 100 * (1. - (k / a.size))
+        kth = xp.percentile(a, kth_quant, interpolation='lower')
+        mask = a > kth
+        return get_sparse_module(a * mask)
+    
 
 def main():
     # Parse command line arguments
@@ -137,6 +160,7 @@ def main():
     future_group.add_argument('--iterations', type=int, default=-1, help='Number of overall model iterations')
     future_group.add_argument('--gd', action='store_true', help='Apply gradient descent for assignment and synset embeddings')
     future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD')
+    future_group.add_argument('--sense_limit', type=float, default=1.1, help='maximum amount of target sense mappings, in terms of source mappings (default=1.1x)')
     
     args = parser.parse_args()
 
@@ -243,6 +267,7 @@ def main():
     cc[:] = src_sns_psinv.dot(xecc)
     print(f'initialized concept embeddings in {time.time()-t01:.2f} seconds', file=sys.stderr)
     if args.verbose:
+        # report precision of psedo-inverse operation, checked by inverting
         pseudo_id = src_senses.transpose().dot(src_senses).dot(src_sns_psinv.get())
         real_id = sparse_id(sense_size)
         rel_diff = (pseudo_id-real_id).sum() / (sense_size*sense_size)
@@ -258,12 +283,19 @@ def main():
         # everything can be done on gpu
         src_senses = get_sparse_module(src_senses)
         trg_senses = get_sparse_module(trg_senses)
+        if args.sense_limit > 0.0:
+            trg_sense_limit = int(args.sense_limit * src_senses.getnnz())
+            if args.verbose:
+                print(f'limiting target side to {trg_sense_limit} sense mappings')
+        else:
+            trg_sense_limit = -1
     
-    # removed similarities memory assignment
+    ### TODO return memory assignment for similarities?
 
     # Training loop
     if args.gd:
-        ### TODO not currently used
+        ### TODO sgd model not currently used
+        ### if uncommented, remember to commit learning.py
         pass
         #sgd_model = SGD(args.gd_lr)
     else:
@@ -307,12 +339,26 @@ def main():
         #print(zw[0] - (get_sparse_module(trg_senses[0]).dot(cc)))  # 1 * emb_dim
         
         if args.gd:
-            ### TODO use sgd_model
-            ### TODO handle l1 condition
-            ### TODO handle sizes and/or threshold sparse matrix
-            # st <- st + 0.001 * (ew - st.dot(es)).dot(es.T)
+            ### TODO use sgd_model?
+            ### TODO enforce nonnegativity
+            ### TODO handle sizes and/or threshold sparse matrix - possibly by batching vocab
+            # st <- st + eta * (ew - st.dot(es)).dot(es.T)
             tg_grad = (zw[:trg_size] - trg_senses.dot(cc)).dot(cc.T)
-            trg_senses += args.gd_lr * get_sparse_module(tg_grad) # memory exception (get_sparse_module)
+            
+            if trg_sense_limit > 0:
+                # allow up to sense_limit updates
+                tg_grad = trim_sparse(tg_grad, trg_sense_limit)
+                trg_senses += args.gd_lr * tg_grad              
+                # allow up to sense_limit nonzeros
+                trg_senses = trim_sparse(trg_senses, trg_sense_limit, issparse=True)
+            else:
+                # need to avoid memory exception somehow
+                tg_grad = get_sparse_module(tg_grad)
+                trg_senses += args.gd_lr * tg_grad
+                threshold = 0.005 ### TODO parametrize
+                trg_senses = get_sparse_module(trg_senses.get().multiply(trg_senses.get() > threshold))
+            
+            ### TODO consider finishing up with lasso (maybe only in final iteration)
             
         else:
             # parallel LASSO (no cuda impl)
