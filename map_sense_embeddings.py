@@ -15,6 +15,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import embeddings
+from heap import Heap
 from cupy_utils import *
 #from learning import SGD, Adam
 
@@ -83,7 +84,6 @@ def psinv2(matr:csr_matrix, dtype, reg=0.):
 def trim_sparse(a, k, issparse=False):
     '''
     Return a sparse matrix with all but top k values zeros
-    TODO change k param to percentile since cupy doesn't have .quantile()
     '''
     if issparse:
         if a.getnnz() <= k:
@@ -97,8 +97,10 @@ def trim_sparse(a, k, issparse=False):
         return a
     else:
         xp = get_array_module(a)
-        kth_quant = 100 * (1. - (k / a.size))
-        kth = xp.percentile(a, kth_quant, interpolation='lower')
+        find_k = Heap(a, k)
+        kth = find_k.kth(k)
+        #kth_quant = 100 * (1. - (k / a.size))
+        #kth = xp.percentile(a, kth_quant, interpolation='lower')
         mask = a > kth
         return get_sparse_module(a * mask)
     
