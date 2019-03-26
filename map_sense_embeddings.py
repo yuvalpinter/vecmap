@@ -107,7 +107,7 @@ def trim_sparse(a, k, issparse=False, clip=None):
         a.data = a.data * mask
         a.eliminate_zeros()
         if clip is not None:
-            a.data *= (clip / a.data.max())
+            a.data.clip(-clip, clip, out=a.data)
         return a
     else:
         maxval = a.max()
@@ -121,7 +121,7 @@ def trim_sparse(a, k, issparse=False, clip=None):
         a *= mask
         sprs = batch_sparse(a)
         if clip is not None:
-            sprs.data *= (clip / sprs.data.max())
+            sprs.data.clip(-clip, clip, out=sprs.data)
         return get_sparse_module(sprs)
     
 
@@ -299,7 +299,6 @@ def main():
     ### TODO initialize trg_senses using seed dictionary instead?
     trg_sns_size = trg_size if args.trim_senses else z.shape[0]
     trg_senses = csr_matrix((trg_sns_size, sense_size))  # using non-cuda scipy because of 'inv' impl
-    ccz = xp.empty_like(z)  # temp for trg_senses calculation
     zecc = xp.empty_like(xecc)  # sense_size * emb_dim
     
     if args.gd:
