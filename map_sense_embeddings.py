@@ -81,6 +81,16 @@ def psinv2(matr:csr_matrix, dtype, reg=0.):
     return get_sparse_module(inv(toinv))  # if direct cuda, add .get() to inv param
 
 
+def batch_sparse(a, batch=500):
+    ### TODO increase default batch if allowed
+    sparses_to_stack = []
+    for i in range(0, a.shape[0], batch):
+        end = min(i+batch, a.shape[0])
+        if end == i: break
+        sparses_to_stack.append(csr_matrix(a[i:end].get()))
+    return vstack(sparses_to_stack)
+    
+    
 def trim_sparse(a, k, issparse=False):
     '''
     Return a sparse matrix with all but top k values zeros
@@ -106,9 +116,10 @@ def trim_sparse(a, k, issparse=False):
                 break
             mask = a > val
         a *= mask
-        nnza = tuple(x.get() for x in a.nonzero())
-        sprs = coo_matrix((a[nnza].get(), nnza), shape=a.shape)
-        sprs = sprs.tocsr()
+        #nnza = tuple(x.get() for x in a.nonzero())
+        #sprs = coo_matrix((a[nnza].get(), nnza), shape=a.shape)
+        #sprs = sprs.tocsr()
+        sprs = batch_sparse(a)
         return get_sparse_module(sprs)
     
 
