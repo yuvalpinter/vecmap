@@ -95,6 +95,7 @@ def trim_sparse(a, k, issparse=False, clip=None):
     '''
     Return a sparse matrix with all but top k values zeros
     TODO ensure 1 nonzero per row + per column
+    TODO clip instead of scaling
     '''
     if issparse:
         if a.getnnz() <= k:
@@ -181,6 +182,7 @@ def main():
     future_group.add_argument('--iterations', type=int, default=-1, help='Number of overall model iterations')
     future_group.add_argument('--gd', action='store_true', help='Apply gradient descent for assignment and synset embeddings')
     future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD')
+    future_group.add_argument('--gd_emb_steps', type=int, default=1, help='Consecutive steps for each sense embedding update phase')
     future_group.add_argument('--sense_limit', type=float, default=1.1, help='maximum amount of target sense mappings, in terms of source mappings (default=1.1x)')
     
     args = parser.parse_args()
@@ -407,9 +409,10 @@ def main():
             ### TODO probably handle sizes and/or threshold sparse matrix
             ### TODO see if it's better to implement vstack over cupy alone, from:
             ### https://github.com/scipy/scipy/blob/v1.2.1/scipy/sparse/construct.py#L468-L499
-            all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'))
-            cc_grad = all_senses.T.dot(xp.concatenate((xw[:src_size], zw[:trg_size])) - all_senses.dot(cc))
-            cc += args.gd_lr * cc_grad
+            for i in range(args.gd_emb_steps):
+                all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'))
+                cc_grad = all_senses.T.dot(xp.concatenate((xw[:src_size], zw[:trg_size])) - all_senses.dot(cc))
+                cc += args.gd_lr * cc_grad
         
         else:
             all_senses = get_sparse_module(vstack((src_senses, trg_senses), format='csr'))
