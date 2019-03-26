@@ -91,7 +91,7 @@ def batch_sparse(a, batch=500):
     return vstack(sparses_to_stack)
     
     
-def trim_sparse(a, k, issparse=False):
+def trim_sparse(a, k, issparse=False, clip=None):
     '''
     Return a sparse matrix with all but top k values zeros
     TODO ensure 1 nonzero per row + per column
@@ -105,6 +105,8 @@ def trim_sparse(a, k, issparse=False):
         mask = a.data > kth
         a.data = a.data * mask
         a.eliminate_zeros()
+        if clip is not None:
+            a.data *= (clip / a.data.max())
         return a
     else:
         maxval = a.max()
@@ -116,10 +118,9 @@ def trim_sparse(a, k, issparse=False):
                 break
             mask = a > val
         a *= mask
-        #nnza = tuple(x.get() for x in a.nonzero())
-        #sprs = coo_matrix((a[nnza].get(), nnza), shape=a.shape)
-        #sprs = sprs.tocsr()
         sprs = batch_sparse(a)
+        if clip is not None:
+            sprs.data *= (clip / sprs.data.max())
         return get_sparse_module(sprs)
     
 
@@ -366,11 +367,11 @@ def main():
             tg_grad = (zw[:trg_size] - trg_senses.dot(cc)).dot(cc.T)
             
             if trg_sense_limit > 0:
-                # allow up to sense_limit updates
-                tg_grad = trim_sparse(tg_grad, trg_sense_limit)
+                # allow up to sense_limit updates, clip gradient
+                tg_grad = trim_sparse(tg_grad, trg_sense_limit, clip=5.)
                 trg_senses += args.gd_lr * tg_grad
                 # allow up to sense_limit nonzeros
-                trg_senses = trim_sparse(trg_senses, trg_sense_limit, issparse=True)
+                trg_senses = trim_sparse(trg_senses, trg_sense_limit, issparse=True, clip=None)
             else:
                 # need to avoid memory exception somehow
                 tg_grad = get_sparse_module(tg_grad)
@@ -396,7 +397,7 @@ def main():
             print(f'objective: {objective:.3f}')
         
         # Write target sense mapping (no time issue)
-        with open(args.tsns_output+f'-it{it:03d}', mode='wb') as tsnsfile:
+        with open('tmp_outs/'+args.tsns_output+f'-it{it:03d}', mode='wb') as tsnsfile:
             pickle.dump(trg_senses, tsnsfile)
         
         ### update synset embeddings (10)
