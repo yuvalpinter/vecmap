@@ -44,6 +44,8 @@ def get_sparse_module(x, dtype='float32'):
     if cupy is not None:
         if type(x) == gpu_sm:
             return x
+        elif type(x) == cupy.ndarray:
+            return gpu_sm(x)
         return gpu_sm(x.astype(dtype))
     else:
         return cpu_sm(x)

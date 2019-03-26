@@ -26,7 +26,7 @@ import re
 import sys
 import time
 import pickle
-from scipy.sparse import csr_matrix, csc_matrix, dia_matrix, identity, vstack, hstack
+from scipy.sparse import csr_matrix, csc_matrix, coo_matrix, dia_matrix, identity, vstack, hstack
 from scipy.sparse.linalg import inv, cg
 from sklearn.linear_model import Lasso
 
@@ -84,6 +84,7 @@ def psinv2(matr:csr_matrix, dtype, reg=0.):
 def trim_sparse(a, k, issparse=False):
     '''
     Return a sparse matrix with all but top k values zeros
+    TODO ensure 1 nonzero per row + per column
     '''
     if issparse:
         if a.getnnz() <= k:
@@ -104,7 +105,11 @@ def trim_sparse(a, k, issparse=False):
             if val >= 1.0:
                 break
             mask = a > val
-        return get_sparse_module(a * mask)
+        a *= mask
+        nnza = tuple(x.get() for x in a.nonzero())
+        sprs = coo_matrix((a[nnza].get(), nnza), shape=a.shape)
+        sprs = sprs.tocsr()
+        return get_sparse_module(sprs)
     
 
 def main():
