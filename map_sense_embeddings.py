@@ -122,7 +122,7 @@ def trim_sparse(a, k, issparse=False, clip=None):
         sprs = batch_sparse(a)
         if clip is not None:
             sprs.data.clip(-clip, clip, out=sprs.data)
-        return get_sparse_module(sprs)
+        return sprs
     
 
 def main():
@@ -137,7 +137,6 @@ def main():
     parser.add_argument('--encoding', default='utf-8', help='the character encoding for input/output (defaults to utf-8)')
     parser.add_argument('--precision', choices=['fp16', 'fp32', 'fp64'], default='fp32', help='the floating-point precision (defaults to fp32)')
     parser.add_argument('--cuda', action='store_true', help='use cuda (requires cupy)')
-    parser.add_argument('--batch_size', default=10000, type=int, help='batch size (defaults to 10000); does not affect results, larger is usually faster but uses more memory')
     parser.add_argument('--seed', type=int, default=0, help='the random seed (defaults to 0)')
 
     recommended_group = parser.add_argument_group('recommended settings', 'Recommended settings for different scenarios')
@@ -180,8 +179,10 @@ def main():
     future_group.add_argument('--inv_delta', type=float, default=0.0001, help='Delta_I added for inverting sense matrix')
     future_group.add_argument('--lasso_iters', type=int, default=10, help='Number of iterations for LASSO/NMF')
     future_group.add_argument('--iterations', type=int, default=-1, help='Number of overall model iterations')
+    future_group.add_argument('--trg_batch', type=int, default=5000, help='Batch size for target steps')
     future_group.add_argument('--gd', action='store_true', help='Apply gradient descent for assignment and synset embeddings')
-    future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD')
+    future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD (default=0.01)')
+    future_group.add_argument('--gd_clip', type=float, default=5., help='Per-coordinate gradient clipping (default=5)')
     future_group.add_argument('--gd_emb_steps', type=int, default=1, help='Consecutive steps for each sense embedding update phase')
     future_group.add_argument('--sense_limit', type=float, default=1.1, help='maximum amount of target sense mappings, in terms of source mappings (default=1.1x)')
     
@@ -300,6 +301,7 @@ def main():
     trg_sns_size = trg_size if args.trim_senses else z.shape[0]
     trg_senses = csr_matrix((trg_sns_size, sense_size))  # using non-cuda scipy because of 'inv' impl
     zecc = xp.empty_like(xecc)  # sense_size * emb_dim
+    #tg_grad = xp.empty((trg_sns_size, sense_size))
     
     if args.gd:
         # everything can be done on gpu
@@ -354,7 +356,7 @@ def main():
         if args.iterations > 0 and it > args.iterations:
             end=True
             
-        ### update target assignments (6) - lasso regression
+        ### update target assignments (6) - lasso-esque regression
         time6 = time.time()            
         # write to trg_senses (which should be sparse)
         # optimize: 0.5 * (xp.linalg.norm(zw[i] - trg_senses[i].dot(cc))^2) + (opts.reglamb * xp.linalg.norm(trg_senses[i],1))
@@ -365,16 +367,28 @@ def main():
             ### TODO enforce nonnegativity
             ### TODO handle sizes and/or threshold sparse matrix - possibly by batching vocab
             # st <- st + eta * (ew - st.dot(es)).dot(es.T)
-            tg_grad = (zw[:trg_size] - trg_senses.dot(cc)).dot(cc.T)
-            
             if trg_sense_limit > 0:
                 # allow up to sense_limit updates, clip gradient
-                tg_grad = trim_sparse(tg_grad, trg_sense_limit, clip=5.)
+                
+                batch_grads = []
+                for i in range(0, trg_size, args.trg_batch):
+                    batch_end = min(i+args.trg_batch, trg_size)
+                    tg_grad_b = (zw[i:batch_end] - trg_senses[i:batch_end].dot(cc)).dot(cc.T)
+                    batch_limit = trg_sense_limit * (batch_end - i) // trg_size
+                    batch_grads.append(trim_sparse(tg_grad_b, batch_limit, clip=args.gd_clip))
+                tg_grad = get_sparse_module(vstack(batch_grads))
+                del tg_grad_b
+                
+                # this used to work, instead of above, until 552f02e. no idea why alloc started failing
+                #tg_grad = (zw[:trg_size] - trg_senses.dot(cc)).dot(cc.T)
+                #tg_grad = get_sparse_module(trim_sparse(tg_grad, trg_sense_limit, clip=args.gd_clip))
+                
                 trg_senses += args.gd_lr * tg_grad
                 # allow up to sense_limit nonzeros
                 trg_senses = trim_sparse(trg_senses, trg_sense_limit, issparse=True, clip=None)
             else:
                 # need to avoid memory exception somehow
+                tg_grad = (zw[:trg_size] - trg_senses.dot(cc)).dot(cc.T)
                 tg_grad = get_sparse_module(tg_grad)
                 trg_senses += args.gd_lr * tg_grad
                 threshold = 0.005 ### TODO parametrize
@@ -411,6 +425,9 @@ def main():
             for i in range(args.gd_emb_steps):
                 all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'))
                 cc_grad = all_senses.T.dot(xp.concatenate((xw[:src_size], zw[:trg_size])) - all_senses.dot(cc))
+                ### TODO maybe switch to norm-based clipping (needs nan handling)
+                #cc_grad /= (args.gd_clip * xp.linalg.norm(cc_grad,axis=1))[0]
+                cc_grad.clip(-args.gd_clip, args.gd_clip, out=cc_grad)
                 cc += args.gd_lr * cc_grad
         
         else:
@@ -440,7 +457,13 @@ def main():
                 print(f'source projection update: {time.time()-time3:.2f}', file=sys.stderr)
             
             time3 = time.time()
-            zecc = z[:trg_size].T.dot(get_sparse_module(trg_senses).toarray()).T
+            
+            zecc.fill(0.)
+            for i in range(0, trg_size, args.trg_batch):
+                end_idx = min(i+args.trg_batch, trg_size)
+                zecc += z[i:end_idx].T.dot(get_sparse_module(trg_senses[i:end_idx]).toarray()).T
+            # this used to work instead of above, until 552f02e
+            #zecc = z[:trg_size].T.dot(get_sparse_module(trg_senses).toarray()).T
             u, s, vt = xp.linalg.svd(cc.T.dot(zecc))
             wz = vt.T.dot(u.T).astype(dtype)
             z.dot(wz, out=zw)
