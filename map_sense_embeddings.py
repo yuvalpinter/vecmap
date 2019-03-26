@@ -15,7 +15,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import embeddings
-from heap import Heap
+#from heap import Heap
 from cupy_utils import *
 #from learning import SGD, Adam
 
@@ -96,12 +96,14 @@ def trim_sparse(a, k, issparse=False):
         a.eliminate_zeros()
         return a
     else:
-        xp = get_array_module(a)
-        find_k = Heap(a, k)
-        kth = find_k.kth(k)
-        #kth_quant = 100 * (1. - (k / a.size))
-        #kth = xp.percentile(a, kth_quant, interpolation='lower')
-        mask = a > kth
+        maxval = a.max()
+        val = maxval / 10
+        mask = a > val
+        while sum(sum(mask)) > k:
+            val *= 1.25  # 10 searches max; with 1.5 it's 5
+            if val >= 1.0:
+                break
+            mask = a > val
         return get_sparse_module(a * mask)
     
 
@@ -350,7 +352,7 @@ def main():
             if trg_sense_limit > 0:
                 # allow up to sense_limit updates
                 tg_grad = trim_sparse(tg_grad, trg_sense_limit)
-                trg_senses += args.gd_lr * tg_grad              
+                trg_senses += args.gd_lr * tg_grad
                 # allow up to sense_limit nonzeros
                 trg_senses = trim_sparse(trg_senses, trg_sense_limit, issparse=True)
             else:
@@ -381,8 +383,8 @@ def main():
         with open(args.tsns_output+f'-it{it:03d}', mode='wb') as tsnsfile:
             pickle.dump(trg_senses, tsnsfile)
         
-        ### update synset embeddings (9)
-        time9 = time.time()
+        ### update synset embeddings (10)
+        time10 = time.time()
         if args.gd:
             ### TODO use sgd_model
             ### TODO probably handle sizes and/or threshold sparse matrix
@@ -400,7 +402,7 @@ def main():
             cc[:] = all_sns_psinv.dot(xzecc)
             
         if args.verbose:
-            print(f'synset embedding update: {time.time()-time9:.2f}', file=sys.stderr)
+            print(f'synset embedding update: {time.time()-time10:.2f}', file=sys.stderr)
             objective = (xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')\
                             + xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) / 2 \
                         + args.reglamb * trg_senses.sum()  # TODO consider thresholding reg part
