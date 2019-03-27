@@ -335,7 +335,7 @@ def main():
             print(f'inversion epsilon: {args.inv_delta}', file=log)
         log.flush()
     
-    best_objective = objective = 10000.
+    best_objective = objective = 1000000.
     it = 1
     last_improvement = 0
     keep_prob = args.stochastic_initial
@@ -405,8 +405,8 @@ def main():
         
         if args.verbose:
             print(f'target sense mapping step: {(time.time()-time6):.2f}, {trg_senses.getnnz()} nonzeros', file=sys.stderr)
-            objective = (xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')\
-                            + xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) / 2 \
+            objective = ((xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro') ** 2)\
+                            + (xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2 \
                         + args.reglamb * trg_senses.sum()  # TODO consider thresholding reg part
             objective = float(objective)
             print(f'objective: {objective:.3f}')
@@ -439,8 +439,8 @@ def main():
             
         if args.verbose:
             print(f'synset embedding update: {time.time()-time10:.2f}', file=sys.stderr)
-            objective = (xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')\
-                            + xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) / 2 \
+            objective = ((xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2\
+                            + (xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2 \
                         + args.reglamb * trg_senses.sum()  # TODO consider thresholding reg part
             objective = float(objective)
             print(f'objective: {objective:.3f}')
@@ -565,10 +565,9 @@ def main():
             # Objective function evaluation
             time_obj = time.time()
             trg_senses_l1 = float(trg_senses.sum())
-            objective = (xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')\
-                            + xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) / 2 \
-                        + args.reglamb * trg_senses_l1  # TODO consider thresholding reg part
-            objective = float(objective)
+            src_obj = float(xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro'))
+            trg_obj = float(xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro'))
+            objective = ((src_obj**2 + trg_obj**2) / 2) + args.reglamb * trg_senses_l1  # TODO consider thresholding reg part
             if args.verbose:
                 print(f'objective calculation: {time.time()-time_obj:.2f}', file=sys.stderr)
             ### TODO create bilingual dictionary?
@@ -587,7 +586,7 @@ def main():
                 print(file=sys.stderr)
                 sys.stderr.flush()
             if args.log is not None:
-                print(f'{it}\t{objective:.3f}\t{trg_senses_l1:.3f}\t{duration:.6f}\t{trg_senses.getnnz()}', file=log)
+                print(f'{it}\t{objective:.3f}\t{src_obj:.3f}\t{trg_obj:.3f}\t{trg_senses_l1:.3f}\t{duration:.6f}\t{trg_senses.getnnz()}', file=log)
                 log.flush()
 
         t = time.time()
