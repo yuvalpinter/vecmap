@@ -564,12 +564,13 @@ def main():
             ### TODO compute the objective, check against a stopping condition 
             # Objective function evaluation
             time_obj = time.time()
+            trg_senses_l1 = float(trg_senses.sum())
             objective = (xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')\
                             + xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) / 2 \
-                        + args.reglamb * trg_senses.sum()  # TODO consider thresholding reg part
+                        + args.reglamb * trg_senses_l1  # TODO consider thresholding reg part
             objective = float(objective)
             if args.verbose:
-                print(f'objective calculation: {time.time()-time_obj:.2f}', file=sys.stderr)  # 0.020 sec
+                print(f'objective calculation: {time.time()-time_obj:.2f}', file=sys.stderr)
             ### TODO create bilingual dictionary?
             
             if objective - best_objective <= -args.threshold:
@@ -581,11 +582,12 @@ def main():
             if args.verbose:
                 print('ITERATION {0} ({1:.2f}s)'.format(it, duration), file=sys.stderr)
                 print('objective: {0:.3f}'.format(objective), file=sys.stderr)
+                print('target senses l_1 norm: {0:.3f}'.format(trg_senses_l1), file=sys.stderr)
                 print('drop probability: {0:.1f}%'.format(100 - 100*keep_prob), file=sys.stderr)
                 print(file=sys.stderr)
                 sys.stderr.flush()
             if args.log is not None:
-                print(f'{it}\t{objective:.6f}\t{duration:.6f}\t{trg_senses.getnnz()}', file=log)
+                print(f'{it}\t{objective:.3f}\t{trg_senses_l1:.3f}\t{duration:.6f}\t{trg_senses.getnnz()}', file=log)
                 log.flush()
 
         t = time.time()
