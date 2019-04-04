@@ -185,6 +185,7 @@ def main():
     future_group.add_argument('--gd_clip', type=float, default=5., help='Per-coordinate gradient clipping (default=5)')
     future_group.add_argument('--gd_emb_steps', type=int, default=1, help='Consecutive steps for each sense embedding update phase')
     future_group.add_argument('--base_prox_lambda', type=float, default=0.99, help='Lambda for proximal gradient in lasso step')
+    future_group.add_argument('--prox_decay', action='store_true', help='Multiply proximal lambda by itself each iteration')
     future_group.add_argument('--sense_limit', type=float, default=1.1, help='maximum amount of target sense mappings, in terms of source mappings (default=1.1x)')
     
     args = parser.parse_args()
@@ -382,12 +383,14 @@ def main():
                 batch_grads.append(batch_sparse(tg_grad_b))
                 
             tg_grad = get_sparse_module(vstack(batch_grads))
-            prox_lambda *= args.base_prox_lambda
             del tg_grad_b
             
+            if args.prox_decay:
+                prox_lambda *= args.base_prox_lambda
+            
             trg_senses += args.gd_lr * tg_grad
+            
             # allow up to sense_limit nonzeros
-                
             if trg_sense_limit > 0:
                 trg_senses = trim_sparse(trg_senses, trg_sense_limit, issparse=True, clip=None)
             
