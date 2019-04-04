@@ -184,6 +184,7 @@ def main():
     future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD (default=0.01)')
     future_group.add_argument('--gd_clip', type=float, default=5., help='Per-coordinate gradient clipping (default=5)')
     future_group.add_argument('--gd_emb_steps', type=int, default=1, help='Consecutive steps for each sense embedding update phase')
+    future_group.add_argument('--base_prox_lambda', type=float, default=0.99, help='Lambda for proximal gradient in lasso step')
     future_group.add_argument('--sense_limit', type=float, default=1.1, help='maximum amount of target sense mappings, in terms of source mappings (default=1.1x)')
     
     args = parser.parse_args()
@@ -318,9 +319,10 @@ def main():
 
     # Training loop
     if args.gd:
+        prox_lambda = args.base_prox_lambda
+        
         ### TODO sgd model not currently used
         ### if uncommented, remember to commit learning.py
-        pass
         #sgd_model = SGD(args.gd_lr)
     else:
         lasso_model = Lasso(alpha=args.reglamb, fit_intercept=False, max_iter=args.lasso_iters,\
@@ -367,32 +369,27 @@ def main():
             ### TODO enforce nonnegativity
             ### TODO handle sizes and/or threshold sparse matrix - possibly by batching vocab
             # st <- st + eta * (ew - st.dot(es)).dot(es.T)
+            # allow up to sense_limit updates, clip gradient
+            
+            batch_grads = []
+            for i in range(0, trg_size, args.trg_batch):
+                batch_end = min(i+args.trg_batch, trg_size)
+                tg_grad_b = (zw[i:batch_end] - trg_senses[i:batch_end].dot(cc)).dot(cc.T)
+                
+                # proximal gradient
+                tg_grad_b -= prox_lambda
+                tg_grad_b.clip(0.0, out=tg_grad_b)
+                batch_grads.append(batch_sparse(tg_grad_b))
+                
+            tg_grad = get_sparse_module(vstack(batch_grads))
+            prox_lambda *= args.base_prox_lambda
+            del tg_grad_b
+            
+            trg_senses += args.gd_lr * tg_grad
+            # allow up to sense_limit nonzeros
+                
             if trg_sense_limit > 0:
-                # allow up to sense_limit updates, clip gradient
-                
-                batch_grads = []
-                for i in range(0, trg_size, args.trg_batch):
-                    batch_end = min(i+args.trg_batch, trg_size)
-                    tg_grad_b = (zw[i:batch_end] - trg_senses[i:batch_end].dot(cc)).dot(cc.T)
-                    batch_limit = trg_sense_limit * (batch_end - i) // trg_size
-                    batch_grads.append(trim_sparse(tg_grad_b, batch_limit, clip=args.gd_clip))
-                tg_grad = get_sparse_module(vstack(batch_grads))
-                del tg_grad_b
-                
-                # this used to work, instead of above, until 552f02e. no idea why alloc started failing
-                #tg_grad = (zw[:trg_size] - trg_senses.dot(cc)).dot(cc.T)
-                #tg_grad = get_sparse_module(trim_sparse(tg_grad, trg_sense_limit, clip=args.gd_clip))
-                
-                trg_senses += args.gd_lr * tg_grad
-                # allow up to sense_limit nonzeros
                 trg_senses = trim_sparse(trg_senses, trg_sense_limit, issparse=True, clip=None)
-            else:
-                # need to avoid memory exception somehow
-                tg_grad = (zw[:trg_size] - trg_senses.dot(cc)).dot(cc.T)
-                tg_grad = get_sparse_module(tg_grad)
-                trg_senses += args.gd_lr * tg_grad
-                threshold = 0.005 ### TODO parametrize
-                trg_senses = get_sparse_module(trg_senses.get().multiply(trg_senses.get() > threshold))
             
             ### TODO consider finishing up with lasso (maybe only in final iteration)
             
@@ -565,9 +562,9 @@ def main():
             # Objective function evaluation
             time_obj = time.time()
             trg_senses_l1 = float(trg_senses.sum())
-            src_obj = float(xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro'))
-            trg_obj = float(xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro'))
-            objective = ((src_obj**2 + trg_obj**2) / 2) + args.reglamb * trg_senses_l1  # TODO consider thresholding reg part
+            src_obj = float(xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2
+            trg_obj = float(xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2
+            objective = ((src_obj + trg_obj) / 2) + args.reglamb * trg_senses_l1  # TODO consider thresholding reg part
             if args.verbose:
                 print(f'objective calculation: {time.time()-time_obj:.2f}', file=sys.stderr)
             ### TODO create bilingual dictionary?
