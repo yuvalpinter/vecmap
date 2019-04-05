@@ -332,6 +332,7 @@ def main():
     if args.log is not None:
         if args.gd:
             print(f'gradient descent lr: {args.gd_lr}', file=log)
+            print(f'base proximal lambda: {args.base_prox_lambda}', file=log)
         else:
             print(f'lasso regularization: {args.reglamb}', file=log)
             print(f'lasso iterations: {args.lasso_iters}', file=log)
@@ -339,6 +340,7 @@ def main():
         log.flush()
     
     best_objective = objective = 1000000.
+    regularization_lambda = args.base_prox_lambda if args.gd else args.reglamb
     it = 1
     last_improvement = 0
     keep_prob = args.stochastic_initial
@@ -362,7 +364,7 @@ def main():
         ### update target assignments (6) - lasso-esque regression
         time6 = time.time()            
         # write to trg_senses (which should be sparse)
-        # optimize: 0.5 * (xp.linalg.norm(zw[i] - trg_senses[i].dot(cc))^2) + (opts.reglamb * xp.linalg.norm(trg_senses[i],1))
+        # optimize: 0.5 * (xp.linalg.norm(zw[i] - trg_senses[i].dot(cc))^2) + (regularization_lambda * xp.linalg.norm(trg_senses[i],1))
         #print(zw[0] - (get_sparse_module(trg_senses[0]).dot(cc)))  # 1 * emb_dim
         
         if args.gd:
@@ -407,7 +409,7 @@ def main():
             print(f'target sense mapping step: {(time.time()-time6):.2f}, {trg_senses.getnnz()} nonzeros', file=sys.stderr)
             objective = ((xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro') ** 2)\
                             + (xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2 \
-                        + args.reglamb * trg_senses.sum()  # TODO consider thresholding reg part
+                        + regularization_lambda * trg_senses.sum()  # TODO consider thresholding reg part
             objective = float(objective)
             print(f'objective: {objective:.3f}')
         
@@ -441,7 +443,7 @@ def main():
             print(f'synset embedding update: {time.time()-time10:.2f}', file=sys.stderr)
             objective = ((xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2\
                             + (xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2 \
-                        + args.reglamb * trg_senses.sum()  # TODO consider thresholding reg part
+                        + regularization_lambda * trg_senses.sum()  # TODO consider thresholding reg part
             objective = float(objective)
             print(f'objective: {objective:.3f}')
         
@@ -565,9 +567,9 @@ def main():
             # Objective function evaluation
             time_obj = time.time()
             trg_senses_l1 = float(trg_senses.sum())
-            src_obj = float(xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2
-            trg_obj = float(xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2
-            objective = ((src_obj + trg_obj) / 2) + args.reglamb * trg_senses_l1  # TODO consider thresholding reg part
+            src_obj = (float(xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2) / 2
+            trg_obj = (float(xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2
+            objective = src_obj + trg_obj + regularization_lambda * trg_senses_l1  # TODO consider thresholding reg part
             if args.verbose:
                 print(f'objective calculation: {time.time()-time_obj:.2f}', file=sys.stderr)
             ### TODO create bilingual dictionary?
