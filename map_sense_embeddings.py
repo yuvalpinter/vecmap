@@ -292,7 +292,10 @@ def main():
     if args.gold_pairs is not None:
         with open(args.gold_pairs,'rb') as gold_pairs_f:
             gold_pairs = pickle.load(gold_pairs_f)
-        print(f'evaluating on {len(gold_pairs)} pairs')
+        gold_trgs = sorted(set([x[0] for x in gold_pairs]))
+        gold_senses = sorted(set([x[1] for x in gold_pairs]))
+        gold_domain_size = len(gold_trgs) * len(gold_senses)
+        print(f'evaluating on {len(gold_pairs)} pairs with {len(gold_trgs)} unique words and {len(gold_senses)} unique senses')
         
     # Initialize the concept embeddings from the source embeddings
     ### TODO maybe try gradient descent instead?
@@ -345,6 +348,8 @@ def main():
             print(f'lasso regularization: {args.reglamb}', file=log)
             print(f'lasso iterations: {args.lasso_iters}', file=log)
             print(f'inversion epsilon: {args.inv_delta}', file=log)
+        if args.gold_pairs is not None:
+            print(f'gold mappings: {len(gold_pairs)}', file=log)
         print(f'Iteration\tObjective\tSource\tTarget\tL_1\tDuration\tNonzeros\tCorrect_mappings', file=log)
         log.flush()
     
@@ -368,15 +373,10 @@ def main():
             end=True
             
         ### update target assignments (6) - lasso-esque regression
-        time6 = time.time()            
-        # write to trg_senses (which should be sparse)
+        time6 = time.time()
         # optimize: 0.5 * (xp.linalg.norm(zw[i] - trg_senses[i].dot(cc))^2) + (regularization_lambda * xp.linalg.norm(trg_senses[i],1))
-        #print(zw[0] - (get_sparse_module(trg_senses[0]).dot(cc)))  # 1 * emb_dim
         
         if args.gd:
-            ### TODO use sgd_model?
-            ### TODO enforce nonnegativity
-            ### TODO handle sizes and/or threshold sparse matrix - possibly by batching vocab
             # st <- st + eta * (ew - st.dot(es)).dot(es.T)
             # allow up to sense_limit updates, clip gradient
             
@@ -426,7 +426,6 @@ def main():
         ### update synset embeddings (10)
         time10 = time.time()
         if args.gd:
-            ### TODO use sgd_model
             ### TODO probably handle sizes and/or threshold sparse matrix
             ### TODO see if it's better to implement vstack over cupy alone, from:
             ### https://github.com/scipy/scipy/blob/v1.2.1/scipy/sparse/construct.py#L468-L499
@@ -543,10 +542,12 @@ def main():
                 last_improvement = it
                 best_objective = objective
 
+            # WordNet transduction evaluation (can't tune on this)
             if args.gold_pairs is not None:
                 np_trg_senses = trg_senses.get()
                 trg_corr = [p for p in gold_pairs if np_trg_senses[p] > args.gold_threshold]
                 correct_mappings = len(trg_corr)
+                domain_trgs = np_trg_senses[gold_trgs][:,gold_senses]
             else:
                 correct_mappings = -1
             
@@ -557,7 +558,7 @@ def main():
                 print('objective: {0:.3f}'.format(objective), file=sys.stderr)
                 print('target senses l_1 norm: {0:.3f}'.format(trg_senses_l1), file=sys.stderr)
                 if len(gold_pairs) > 0:
-                    print(f'{correct_mappings} correct target mappings of {trg_senses.getnnz()}', file=sys.stderr)
+                    print(f'{correct_mappings} correct target mappings: {(correct_mappings/len(gold_pairs)):.3f} recall, {(correct_mappings/domain_trgs.getnnz()):.3f} precision', file=sys.stderr)
                 print(file=sys.stderr)
                 sys.stderr.flush()
             if args.log is not None:
