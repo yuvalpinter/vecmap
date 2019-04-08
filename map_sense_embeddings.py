@@ -15,9 +15,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import embeddings
-#from heap import Heap
 from cupy_utils import *
-#from learning import SGD, Adam
 
 import argparse
 import collections
@@ -186,7 +184,9 @@ def main():
     future_group.add_argument('--gd_emb_steps', type=int, default=1, help='Consecutive steps for each sense embedding update phase')
     future_group.add_argument('--base_prox_lambda', type=float, default=0.99, help='Lambda for proximal gradient in lasso step')
     future_group.add_argument('--prox_decay', action='store_true', help='Multiply proximal lambda by itself each iteration')
-    future_group.add_argument('--sense_limit', type=float, default=1.1, help='maximum amount of target sense mappings, in terms of source mappings (default=1.1x)')
+    future_group.add_argument('--sense_limit', type=float, default=1.1, help='Maximum amount of target sense mappings, in terms of source mappings (default=1.1x)')
+    future_group.add_argument('--gold_pairs', help='Gold data for evaluation, if exists (not for tuning)')
+    future_group.add_argument('--gold_threshold', type=float, default=0.0, help='Threshold for gold mapping (0 is fine if sparse)')
     
     args = parser.parse_args()
 
@@ -276,12 +276,24 @@ def main():
         ### TODO might also need this if not trimming (probably kinda far away)
         newcols = [csc_matrix(([1],([i],[0])),shape=(src_size,1)) for i in range(src_size)\
                    if src_senses.getrow(i).getnnz() == 0]
+        #with open(f'data/synsets/dummy_synsets_v3b_{src_size}','wb') as dummy_cols_file:
+        #    dummy_col_idcs = [i for i in range(src_size) if src_senses.getrow(i).getnnz() == 0]
+        #    pickle.dump(np.array(dummy_col_idcs), dummy_cols_file)
+        
         # trim senses no longer used, add new ones
         colsums = src_senses.sum(axis=0).tolist()[0]
-        src_senses = hstack([src_senses[:,[i for i,j in enumerate(colsums) if j>0]]] + newcols)
+        kept_senses = [i for i,j in enumerate(colsums) if j>0]
+        #with open(f'data/synsets/kept_synsets_v3b_{src_size}','wb') as kept_save_file:
+        #    pickle.dump(np.array(kept_senses), kept_save_file)
+        src_senses = hstack([src_senses[:,kept_senses]] + newcols)
         print(f'trimmed sense dictionary dimensions: {src_senses.shape} with {src_senses.getnnz()} nonzeros')
     sense_size = src_senses.shape[1]
     
+    if args.gold_pairs is not None:
+        with open(args.gold_pairs,'rb') as gold_pairs_f:
+            gold_pairs = pickle.load(gold_pairs_f)
+        print(f'evaluating on {len(gold_pairs)} pairs')
+        
     # Initialize the concept embeddings from the source embeddings
     ### TODO maybe try gradient descent instead?
     ### TODO (pre-)create non-singular alignment matrix
@@ -321,10 +333,6 @@ def main():
     # Training loop
     if args.gd:
         prox_lambda = args.base_prox_lambda
-        
-        ### TODO sgd model not currently used
-        ### if uncommented, remember to commit learning.py
-        #sgd_model = SGD(args.gd_lr)
     else:
         lasso_model = Lasso(alpha=args.reglamb, fit_intercept=False, max_iter=args.lasso_iters,\
                             positive=True, warm_start=True)  # TODO more parametrization
@@ -337,25 +345,23 @@ def main():
             print(f'lasso regularization: {args.reglamb}', file=log)
             print(f'lasso iterations: {args.lasso_iters}', file=log)
             print(f'inversion epsilon: {args.inv_delta}', file=log)
+        print(f'Iteration\tObjective\tSource\tTarget\tL_1\tDuration\tNonzeros\tCorrect_mappings', file=log)
         log.flush()
     
     best_objective = objective = 1000000.
+    correct_mappings = -1
     regularization_lambda = args.base_prox_lambda if args.gd else args.reglamb
     it = 1
     last_improvement = 0
-    keep_prob = args.stochastic_initial
     t = time.time()
     end = False
     print('starting training')
     while True:
         if it % 50 == 0:
-            print(f'starting iteration {it}, last objective was {objective}')
+            print(f'starting iteration {it}, last objective was {objective}, correct mappings at {correct_mappings}')
 
         # Increase the keep probability if we have not improved in args.stochastic_interval iterations
         if it - last_improvement > args.stochastic_interval:
-            if keep_prob >= 1.0:
-                end = True
-            keep_prob = min(1.0, args.stochastic_multiplier*keep_prob)
             last_improvement = it
         
         if args.iterations > 0 and it > args.iterations:
@@ -406,7 +412,7 @@ def main():
             trg_senses = lasso_model.sparse_coef_
         
         if args.verbose:
-            print(f'target sense mapping step: {(time.time()-time6):.2f}, {trg_senses.getnnz()} nonzeros', file=sys.stderr)
+            print(f'target sense mapping step: {(time.time()-time6):.2f} seconds, {trg_senses.getnnz()} nonzeros', file=sys.stderr)
             objective = ((xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro') ** 2)\
                             + (xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2 \
                         + regularization_lambda * trg_senses.sum()  # TODO consider thresholding reg part
@@ -414,8 +420,8 @@ def main():
             print(f'objective: {objective:.3f}')
         
         # Write target sense mapping (no time issue)
-        with open('tmp_outs/'+args.tsns_output+f'-it{it:03d}', mode='wb') as tsnsfile:
-            pickle.dump(trg_senses, tsnsfile)
+        with open(f'tmp_outs/{args.tsns_output[:-4]}-it{it:03d}.pkl', mode='wb') as tsnsfile:
+            pickle.dump(trg_senses.get(), tsnsfile)
         
         ### update synset embeddings (10)
         time10 = time.time()
@@ -524,46 +530,6 @@ def main():
         if end:
             break
         else:
-            if False: ### TODO strip for parts
-                # Update the training dictionary (default direction - union)
-                if args.direction in ('forward', 'union'):
-                    if args.csls_neighborhood > 0:  # default acl2018: 10
-                        for i in range(0, trg_size, simbwd.shape[0]):
-                            j = min(i + simbwd.shape[0], trg_size)  # get next batch to operate on
-                            zw[i:j].dot(xw[:src_size].T, out=simbwd[:j-i])
-                            knn_sim_bwd[i:j] = topk_mean(simbwd[:j-i], k=args.csls_neighborhood, inplace=True)
-                    for i in range(0, src_size, simfwd.shape[0]):
-                        j = min(i + simfwd.shape[0], src_size)
-                        xw[i:j].dot(zw[:trg_size].T, out=simfwd[:j-i])
-                        simfwd[:j-i].max(axis=1, out=best_sim_forward[i:j])
-                        simfwd[:j-i] -= knn_sim_bwd/2  # Equivalent to the real CSLS scores for NN
-                        
-                        # softmaxing
-                        for k in range(args.max_align):
-                            argsimsf = dropout(simfwd[:j-i], 1 - keep_prob).argmax(axis=1)
-                            simfwd[:j-i,argsimsf] = -200
-                            trg_indices_forward[(k*src_size)+i:(k*src_size)+j] = argsimsf
-                if args.direction in ('backward', 'union'):
-                    if args.csls_neighborhood > 0:
-                        for i in range(0, src_size, simfwd.shape[0]):
-                            j = min(i + simfwd.shape[0], src_size)  # get next batch to operate on
-                            xw[i:j].dot(zw[:trg_size].T, out=simfwd[:j-i])
-                            knn_sim_fwd[i:j] = topk_mean(simfwd[:j-i], k=args.csls_neighborhood, inplace=True)
-                    for i in range(0, trg_size, simbwd.shape[0]):
-                        j = min(i + simbwd.shape[0], trg_size)
-                        zw[i:j].dot(xw[:src_size].T, out=simbwd[:j-i])
-                        simbwd[:j-i].max(axis=1, out=best_sim_backward[i:j])
-                        simbwd[:j-i] -= knn_sim_fwd/2  # Equivalent to the real CSLS scores for NN
-                        
-                        # softmaxing
-                        for k in range(args.max_align):
-                            argsimsb = dropout(simbwd[:j-i], 1 - keep_prob).argmax(axis=1)
-                            simbwd[:j-i,argsimsb] = -200
-                            trg_indices_backward[(k*trg_size)+i:(k*trg_size)+j] = argsimsb
-                src_indices = xp.concatenate((src_indices_forward, src_indices_backward))
-                trg_indices = xp.concatenate((trg_indices_forward, trg_indices_backward))
-
-            ### TODO compute the objective, check against a stopping condition 
             # Objective function evaluation
             time_obj = time.time()
             trg_senses_l1 = float(trg_senses.sum())
@@ -572,23 +538,30 @@ def main():
             objective = src_obj + trg_obj + regularization_lambda * trg_senses_l1  # TODO consider thresholding reg part
             if args.verbose:
                 print(f'objective calculation: {time.time()-time_obj:.2f}', file=sys.stderr)
-            ### TODO create bilingual dictionary?
             
             if objective - best_objective <= -args.threshold:
                 last_improvement = it
                 best_objective = objective
 
+            if args.gold_pairs is not None:
+                np_trg_senses = trg_senses.get()
+                trg_corr = [p for p in gold_pairs if np_trg_senses[p] > args.gold_threshold]
+                correct_mappings = len(trg_corr)
+            else:
+                correct_mappings = -1
+            
             # Logging
             duration = time.time() - t
             if args.verbose:
                 print('ITERATION {0} ({1:.2f}s)'.format(it, duration), file=sys.stderr)
                 print('objective: {0:.3f}'.format(objective), file=sys.stderr)
                 print('target senses l_1 norm: {0:.3f}'.format(trg_senses_l1), file=sys.stderr)
-                print('drop probability: {0:.1f}%'.format(100 - 100*keep_prob), file=sys.stderr)
+                if len(gold_pairs) > 0:
+                    print(f'{correct_mappings} correct target mappings of {trg_senses.getnnz()}', file=sys.stderr)
                 print(file=sys.stderr)
                 sys.stderr.flush()
             if args.log is not None:
-                print(f'{it}\t{objective:.3f}\t{src_obj:.3f}\t{trg_obj:.3f}\t{trg_senses_l1:.3f}\t{duration:.6f}\t{trg_senses.getnnz()}', file=log)
+                print(f'{it}\t{objective:.3f}\t{src_obj:.3f}\t{trg_obj:.3f}\t{trg_senses_l1:.3f}\t{duration:.6f}\t{trg_senses.getnnz()}\t{correct_mappings}', file=log)
                 log.flush()
 
         t = time.time()
@@ -602,7 +575,7 @@ def main():
     
     # Write target sense mapping
     with open(args.tsns_output, mode='wb') as tsnsfile:
-        pickle.dump(trg_senses, tsnsfile)
+        pickle.dump(trg_senses.get(), tsnsfile)
 
 if __name__ == '__main__':
     main()
