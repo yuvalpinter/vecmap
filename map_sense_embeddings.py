@@ -22,6 +22,7 @@ import numpy as np
 import sys
 import time
 import pickle
+from math import floor, pow
 from scipy.sparse import csr_matrix, csc_matrix, dia_matrix, identity, vstack, hstack
 from scipy.sparse.linalg import inv, cg
 from sklearn.linear_model import Lasso
@@ -144,6 +145,7 @@ def main():
     future_group.add_argument('--trg_batch', type=int, default=5000, help='Batch size for target steps')
     future_group.add_argument('--gd', action='store_true', help='Apply gradient descent for assignment and synset embeddings')
     future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD (default=0.01)')
+    future_group.add_argument('--gd_wd', action='store_true', help='Weight decay in SGD')
     future_group.add_argument('--gd_clip', type=float, default=5., help='Per-coordinate gradient clipping (default=5)')
     future_group.add_argument('--gd_emb_steps', type=int, default=1, help='Consecutive steps for each sense embedding update phase')
     future_group.add_argument('--base_prox_lambda', type=float, default=0.99, help='Lambda for proximal gradient in lasso step')
@@ -156,9 +158,9 @@ def main():
 
     # pre-setting groups
     if args.toy:
-        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=50, csls_neighborhood=10, trim_senses=True, inv_delta=1., reglamb=0.2, lasso_iters=100)
+        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=50, csls_neighborhood=10, trim_senses=True, inv_delta=1., reglamb=0.2, lasso_iters=100, gd_wd=True)
     if args.unsupervised or args.future:
-        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=2000, csls_neighborhood=10, trim_senses=True)
+        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=2000, csls_neighborhood=10, trim_senses=True, gd_wd=True)
     if args.unsupervised or args.acl2018:
         parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=20000, csls_neighborhood=10)
     args = parser.parse_args()
@@ -323,6 +325,8 @@ def main():
     it = 1
     last_improvement = 0
     t = time.time()
+    map_gd_lr = args.gd_lr
+    emb_gd_lr = args.gd_lr
     end = False
     print('starting training')
     while True:
@@ -360,7 +364,8 @@ def main():
             if args.prox_decay:
                 prox_lambda *= args.base_prox_lambda
             
-            trg_senses += args.gd_lr * tg_grad
+            ### TODO consider weight decay here as well (args.gd_wd)
+            trg_senses += map_gd_lr * tg_grad
             
             # allow up to sense_limit nonzeros
             if trg_sense_limit > 0:
@@ -393,13 +398,19 @@ def main():
             ### TODO probably handle sizes and/or threshold sparse matrix
             ### TODO see if it's better to implement vstack over cupy alone, from:
             ### https://github.com/scipy/scipy/blob/v1.2.1/scipy/sparse/construct.py#L468-L499
+            if args.gd_wd:
+                true_it = (it-1) * args.gd_emb_steps
+                emb_gd_lr = args.gd_lr * pow(0.5, floor((1+true_it)/50.0))
+                if args.verbose:
+                    print(f'embedding learning rate: {emb_gd_lr}')
+                    
             for i in range(args.gd_emb_steps):
                 all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'))
                 cc_grad = all_senses.T.dot(xp.concatenate((xw[:src_size], zw[:trg_size])) - all_senses.dot(cc))
                 ### TODO maybe switch to norm-based clipping (needs nan handling)
                 #cc_grad /= (args.gd_clip * xp.linalg.norm(cc_grad,axis=1))[0]
                 cc_grad.clip(-args.gd_clip, args.gd_clip, out=cc_grad)
-                cc += args.gd_lr * cc_grad
+                cc += emb_gd_lr * cc_grad
         
         else:
             all_senses = get_sparse_module(vstack((src_senses, trg_senses), format='csr'))
@@ -526,7 +537,7 @@ def main():
                 print(file=sys.stderr)
                 sys.stderr.flush()
             if args.log is not None:
-                print(f'{it}\t{objective:.3f}\t{src_obj:.3f}\t{trg_obj:.3f}\t{trg_senses_l1:.3f}\t{duration:.6f}\t{trg_senses.getnnz()}\t{correct_mappings}', file=log)
+                print(f'{it}\t{objective:.3f}\t{src_obj:.3f}\t{trg_obj:.3f}\t{trg_senses_l1:.3f}\t{duration:.3f}\t{trg_senses.getnnz()}\t{correct_mappings}', file=log)
                 log.flush()
 
         t = time.time()
