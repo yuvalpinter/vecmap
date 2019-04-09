@@ -18,13 +18,11 @@ import embeddings
 from cupy_utils import *
 
 import argparse
-import collections
 import numpy as np
-import re
 import sys
 import time
 import pickle
-from scipy.sparse import csr_matrix, csc_matrix, coo_matrix, dia_matrix, identity, vstack, hstack
+from scipy.sparse import csr_matrix, csc_matrix, dia_matrix, identity, vstack, hstack
 from scipy.sparse.linalg import inv, cg
 from sklearn.linear_model import Lasso
 
@@ -36,24 +34,6 @@ def dropout(m, p):
         xp = get_array_module(m)
         mask = xp.random.rand(*m.shape) >= p
         return m*mask
-
-
-def topk_mean(m, k, inplace=False):  # TODO Assuming that axis is 1
-    xp = get_array_module(m)
-    n = m.shape[0]
-    ans = xp.zeros(n, dtype=m.dtype)
-    if k <= 0:
-        return ans
-    if not inplace:
-        m = xp.array(m)
-    ind0 = xp.arange(n)
-    ind1 = xp.empty(n, dtype=int)
-    minimum = m.min()
-    for i in range(k):
-        m.argmax(axis=1, out=ind1)
-        ans += m[ind0, ind1]
-        m[ind0, ind1] = minimum
-    return ans / k
 
     
 def sparse_id(n):
@@ -89,38 +69,22 @@ def batch_sparse(a, batch=500):
     return vstack(sparses_to_stack)
     
     
-def trim_sparse(a, k, issparse=False, clip=None):
+def trim_sparse(a, k, clip=None):
     '''
     Return a sparse matrix with all but top k values zeros
-    TODO ensure 1 nonzero per row + per column
-    TODO clip instead of scaling
+    TODO ensure few nonzeros per row + per column
     '''
-    if issparse:
-        if a.getnnz() <= k:
-            return a
-        kth_quant = 100 * (1. - (k / a.getnnz()))
-        xp = get_array_module(a.data)
-        kth = xp.percentile(a.data, kth_quant, interpolation='lower')
-        mask = a.data > kth
-        a.data = a.data * mask
-        a.eliminate_zeros()
-        if clip is not None:
-            a.data.clip(-clip, clip, out=a.data)
+    if a.getnnz() <= k:
         return a
-    else:
-        maxval = a.max()
-        val = maxval / 10
-        mask = a > val
-        while sum(sum(mask)) > k:
-            val *= 1.25  # 10 searches max; with 1.5 it's 5
-            if val >= 1.0:
-                break
-            mask = a > val
-        a *= mask
-        sprs = batch_sparse(a)
-        if clip is not None:
-            sprs.data.clip(-clip, clip, out=sprs.data)
-        return sprs
+    kth_quant = 100 * (1. - (k / a.getnnz()))
+    xp = get_array_module(a.data)
+    kth = xp.percentile(a.data, kth_quant, interpolation='lower')
+    mask = a.data > kth
+    a.data = a.data * mask
+    a.eliminate_zeros()
+    if clip is not None:
+        a.data.clip(-clip, clip, out=a.data)
+    return a
     
 
 def main():
@@ -400,7 +364,7 @@ def main():
             
             # allow up to sense_limit nonzeros
             if trg_sense_limit > 0:
-                trg_senses = trim_sparse(trg_senses, trg_sense_limit, issparse=True, clip=None)
+                trg_senses = trim_sparse(trg_senses, trg_sense_limit, clip=None)
             
             ### TODO consider finishing up with lasso (maybe only in final iteration)
             
