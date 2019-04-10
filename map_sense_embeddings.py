@@ -147,6 +147,7 @@ def main():
     future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD (default=0.01)')
     future_group.add_argument('--gd_wd', action='store_true', help='Weight decay in SGD')
     future_group.add_argument('--gd_clip', type=float, default=5., help='Per-coordinate gradient clipping (default=5)')
+    future_group.add_argument('--gd_map_steps', type=int, default=1, help='Consecutive steps for each target-sense mapping update phase')
     future_group.add_argument('--gd_emb_steps', type=int, default=1, help='Consecutive steps for each sense embedding update phase')
     future_group.add_argument('--base_prox_lambda', type=float, default=0.99, help='Lambda for proximal gradient in lasso step')
     future_group.add_argument('--prox_decay', action='store_true', help='Multiply proximal lambda by itself each iteration')
@@ -345,27 +346,34 @@ def main():
         # optimize: 0.5 * (xp.linalg.norm(zw[i] - trg_senses[i].dot(cc))^2) + (regularization_lambda * xp.linalg.norm(trg_senses[i],1))
         
         if args.gd:
-            # st <- st + eta * (ew - st.dot(es)).dot(es.T)
-            # allow up to sense_limit updates, clip gradient
+            if args.gd_wd:
+                true_it = (it-1) * args.gd_map_steps
+                map_gd_lr = args.gd_lr * pow(0.5, floor((1+true_it)/50.0))
+                if args.verbose:
+                    print(f'mapping learning rate: {map_gd_lr}')            
             
-            batch_grads = []
-            for i in range(0, trg_size, args.trg_batch):
-                batch_end = min(i+args.trg_batch, trg_size)
-                tg_grad_b = (zw[i:batch_end] - trg_senses[i:batch_end].dot(cc)).dot(cc.T)
+            for k in range(args.gd_map_steps):
+                # st <- st + eta * (ew - st.dot(es)).dot(es.T)
+                # allow up to sense_limit updates, clip gradient
                 
-                # proximal gradient
-                tg_grad_b -= prox_lambda
-                tg_grad_b.clip(0.0, out=tg_grad_b)
-                batch_grads.append(batch_sparse(tg_grad_b))
+                batch_grads = []
+                for i in range(0, trg_size, args.trg_batch):
+                    batch_end = min(i+args.trg_batch, trg_size)
+                    tg_grad_b = (zw[i:batch_end] - trg_senses[i:batch_end].dot(cc)).dot(cc.T)
+                    
+                    # proximal gradient
+                    tg_grad_b -= prox_lambda
+                    tg_grad_b.clip(0.0, out=tg_grad_b)
+                    batch_grads.append(batch_sparse(tg_grad_b))
+                    
+                tg_grad = get_sparse_module(vstack(batch_grads))
+                del tg_grad_b
                 
-            tg_grad = get_sparse_module(vstack(batch_grads))
-            del tg_grad_b
-            
-            if args.prox_decay:
-                prox_lambda *= args.base_prox_lambda
-            
-            ### TODO consider weight decay here as well (args.gd_wd)
-            trg_senses += map_gd_lr * tg_grad
+                if args.prox_decay:
+                    prox_lambda *= args.base_prox_lambda
+                
+                ### TODO consider weight decay here as well (args.gd_wd)
+                trg_senses += map_gd_lr * tg_grad
             
             # allow up to sense_limit nonzeros
             if trg_sense_limit > 0:
