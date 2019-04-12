@@ -323,7 +323,7 @@ def main():
         print(f'Iteration\tObjective\tSource\tTarget\tL_1\tDuration\tNonzeros\tCorrect_mappings', file=log)
         log.flush()
     
-    best_objective = objective = 1000000.
+    best_objective = objective = 1000000000.
     correct_mappings = -1
     regularization_lambda = args.base_prox_lambda if args.gd else args.reglamb
     it = 1
@@ -417,50 +417,11 @@ def main():
             
             all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'), dtype=dtype)         
             #all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'), dtype=dtype, normalize=True)
-            aw = xp.concatenate((xw[:src_size], zw[:trg_size]))
-            
-            
-            todot = psinv(all_senses.T.get(),dtype,reg=0.001).dot(aw)
-            closed_cc = get_sparse_module(all_senses.T.get()).dot(todot)
-            
+            aw = xp.concatenate((xw[:src_size], zw[:trg_size]))            
             
             for i in range(args.gd_emb_steps):
-            
-                if i % 50 == 0:
-                    print(i, xp.linalg.norm(closed_cc-cc))
-            
                 cc_grad = all_senses.T.dot(aw - all_senses.dot(cc))
-                ### TODO maybe switch to norm-based clipping (needs nan handling)
-                #cc_grad /= (args.gd_clip * xp.linalg.norm(cc_grad,axis=1))[0]
-                
-                if args.debug:
-                    # check gradient
-                    delta = 1e-4
-                    obj_diffs = xp.zeros_like(cc)
-                    for k in range(obj_diffs.shape[0]):
-                        for l in range(obj_diffs.shape[1]):
-                            cc_tag = xp.array(cc)
-                            if k==28 and l==7: print(cc_tag[k,l-1])
-                            if k==28 and l==6: print(cc_tag[k,l])
-                            cc_tag[k,l] -= delta/2
-                            if k==28 and l==6: print(cc_tag[k,l])
-                            obj_min = pow(float(xp.linalg.norm(aw - all_senses.dot(cc_tag),'fro')), 2) / 2
-                            if k==28 and l==6: print(obj_min)
-                            cc_tag[k,l] += delta
-                            if k==28 and l==6: print(cc_tag[k,l])
-                            obj_plu = pow(float(xp.linalg.norm(aw - all_senses.dot(cc_tag),'fro')), 2) / 2
-                            if k==28 and l==6: print(obj_plu)
-                            diff = (obj_min - obj_plu) / delta
-                            if k==28 and l==6: print(diff, cc_grad[k, l])
-                            obj_diffs[k,l] = (obj_min - obj_plu) / delta
-                    print(f'grad norm = {xp.linalg.norm(cc_grad)}, RHS norm = {xp.linalg.norm(obj_diffs)}')
-                    grad_diff = xp.linalg.norm(cc_grad-obj_diffs)
-                    print(f'norm(grad-RHS) = {grad_diff}')
-                    print(f'norm / |coordinates| = {grad_diff / (obj_diffs.shape[0] * obj_diffs.shape[1])}')
-                
                 cc_grad.clip(-args.gd_clip, args.gd_clip, out=cc_grad)
-                
-                # actual step
                 cc += emb_gd_lr * cc_grad
                         
         else:
