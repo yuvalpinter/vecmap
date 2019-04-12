@@ -44,7 +44,7 @@ def sparse_id(n):
 def psinv(matr, dtype, reg=0.):
     regsize = matr.shape[1]
     toinv = matr.transpose().dot(matr)
-    precond = dia_matrix((1/(toinv.diagonal()),0),shape=(regsize,regsize))
+    precond = dia_matrix((1/(toinv.diagonal()+reg),0),shape=(regsize,regsize))
     fullid = identity(regsize)
     return get_sparse_module(vstack([csr_matrix(cg(toinv, fullid.getrow(i).transpose().toarray(), maxiter=1, M=precond)[0]) \
                                     for i in range(regsize)]))
@@ -146,6 +146,7 @@ def main():
     future_group.add_argument('--gd', action='store_true', help='Apply gradient descent for assignment and synset embeddings')
     future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD (default=0.01)')
     future_group.add_argument('--gd_wd', action='store_true', help='Weight decay in SGD')
+    future_group.add_argument('--gd_wd_hl', type=int, default=100, help='Weight decay half-life in SGD, default=100')
     future_group.add_argument('--gd_clip', type=float, default=5., help='Per-coordinate gradient clipping (default=5)')
     future_group.add_argument('--gd_map_steps', type=int, default=1, help='Consecutive steps for each target-sense mapping update phase')
     future_group.add_argument('--gd_emb_steps', type=int, default=1, help='Consecutive steps for each sense embedding update phase')
@@ -155,11 +156,13 @@ def main():
     future_group.add_argument('--gold_pairs', help='Gold data for evaluation, if exists (not for tuning)')
     future_group.add_argument('--gold_threshold', type=float, default=0.0, help='Threshold for gold mapping (0 is fine if sparse)')
     
+    future_group.add_argument('--debug', action='store_true')
+    
     args = parser.parse_args()
 
     # pre-setting groups
     if args.toy:
-        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=50, csls_neighborhood=10, trim_senses=True, inv_delta=1., reglamb=0.2, lasso_iters=100, gd_wd=True)
+        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=50, csls_neighborhood=10, trim_senses=True, inv_delta=1., reglamb=0.2, lasso_iters=100, gd_wd=True, log='map-toy.log')
     if args.unsupervised or args.future:
         parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=2000, csls_neighborhood=10, trim_senses=True, gd_wd=True)
     if args.unsupervised or args.acl2018:
@@ -267,7 +270,7 @@ def main():
     # Initialize the concept embeddings from the source embeddings
     ### TODO maybe try gradient descent instead?
     ### TODO (pre-)create non-singular alignment matrix
-    cc = xp.empty((sense_size, emb_dim))  # \tilde{E}
+    cc = xp.empty((sense_size, emb_dim), dtype=dtype)  # \tilde{E}
     print('starting psinv calc')
     t01 = time.time()
     src_sns_psinv = psinv(src_senses, dtype, args.inv_delta)
@@ -289,8 +292,8 @@ def main():
     
     if args.gd:
         # everything can be done on gpu
-        src_senses = get_sparse_module(src_senses)
-        trg_senses = get_sparse_module(trg_senses)
+        src_senses = get_sparse_module(src_senses, dtype=dtype)
+        trg_senses = get_sparse_module(trg_senses, dtype=dtype)
         if args.sense_limit > 0.0:
             trg_sense_limit = int(args.sense_limit * src_senses.getnnz())
             if args.verbose:
@@ -348,9 +351,9 @@ def main():
         if args.gd:
             if args.gd_wd:
                 true_it = (it-1) * args.gd_map_steps
-                map_gd_lr = args.gd_lr * pow(0.5, floor((1+true_it)/50.0))
+                map_gd_lr = args.gd_lr * pow(0.5, floor((1+true_it)/args.gd_wd_hl))
                 if args.verbose:
-                    print(f'mapping learning rate: {map_gd_lr}')            
+                    print(f'mapping learning rate: {map_gd_lr}')
             
             for k in range(args.gd_map_steps):
                 # st <- st + eta * (ew - st.dot(es)).dot(es.T)
@@ -375,9 +378,9 @@ def main():
                 ### TODO consider weight decay here as well (args.gd_wd)
                 trg_senses += map_gd_lr * tg_grad
             
-            # allow up to sense_limit nonzeros
-            if trg_sense_limit > 0:
-                trg_senses = trim_sparse(trg_senses, trg_sense_limit, clip=None)
+                # allow up to sense_limit nonzeros
+                if trg_sense_limit > 0:
+                    trg_senses = trim_sparse(trg_senses, trg_sense_limit, clip=None)
             
             ### TODO consider finishing up with lasso (maybe only in final iteration)
             
@@ -408,18 +411,58 @@ def main():
             ### https://github.com/scipy/scipy/blob/v1.2.1/scipy/sparse/construct.py#L468-L499
             if args.gd_wd:
                 true_it = (it-1) * args.gd_emb_steps
-                emb_gd_lr = args.gd_lr * pow(0.5, floor((1+true_it)/50.0))
+                emb_gd_lr = args.gd_lr * pow(0.5, floor((1+true_it)/args.gd_wd_hl))
                 if args.verbose:
                     print(f'embedding learning rate: {emb_gd_lr}')
-                    
+            
+            all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'), dtype=dtype)         
+            #all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'), dtype=dtype, normalize=True)
+            aw = xp.concatenate((xw[:src_size], zw[:trg_size]))
+            
+            
+            todot = psinv(all_senses.T.get(),dtype,reg=0.001).dot(aw)
+            closed_cc = get_sparse_module(all_senses.T.get()).dot(todot)
+            
+            
             for i in range(args.gd_emb_steps):
-                all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'))
-                cc_grad = all_senses.T.dot(xp.concatenate((xw[:src_size], zw[:trg_size])) - all_senses.dot(cc))
+            
+                if i % 50 == 0:
+                    print(i, xp.linalg.norm(closed_cc-cc))
+            
+                cc_grad = all_senses.T.dot(aw - all_senses.dot(cc))
                 ### TODO maybe switch to norm-based clipping (needs nan handling)
                 #cc_grad /= (args.gd_clip * xp.linalg.norm(cc_grad,axis=1))[0]
+                
+                if args.debug:
+                    # check gradient
+                    delta = 1e-4
+                    obj_diffs = xp.zeros_like(cc)
+                    for k in range(obj_diffs.shape[0]):
+                        for l in range(obj_diffs.shape[1]):
+                            cc_tag = xp.array(cc)
+                            if k==28 and l==7: print(cc_tag[k,l-1])
+                            if k==28 and l==6: print(cc_tag[k,l])
+                            cc_tag[k,l] -= delta/2
+                            if k==28 and l==6: print(cc_tag[k,l])
+                            obj_min = pow(float(xp.linalg.norm(aw - all_senses.dot(cc_tag),'fro')), 2) / 2
+                            if k==28 and l==6: print(obj_min)
+                            cc_tag[k,l] += delta
+                            if k==28 and l==6: print(cc_tag[k,l])
+                            obj_plu = pow(float(xp.linalg.norm(aw - all_senses.dot(cc_tag),'fro')), 2) / 2
+                            if k==28 and l==6: print(obj_plu)
+                            diff = (obj_min - obj_plu) / delta
+                            if k==28 and l==6: print(diff, cc_grad[k, l])
+                            obj_diffs[k,l] = (obj_min - obj_plu) / delta
+                    print(f'grad norm = {xp.linalg.norm(cc_grad)}, RHS norm = {xp.linalg.norm(obj_diffs)}')
+                    grad_diff = xp.linalg.norm(cc_grad-obj_diffs)
+                    print(f'norm(grad-RHS) = {grad_diff}')
+                    print(f'norm / |coordinates| = {grad_diff / (obj_diffs.shape[0] * obj_diffs.shape[1])}')
+                
                 cc_grad.clip(-args.gd_clip, args.gd_clip, out=cc_grad)
+                
+                # actual step
                 cc += emb_gd_lr * cc_grad
-        
+                        
         else:
             all_senses = get_sparse_module(vstack((src_senses, trg_senses), format='csr'))
             xzecc = xp.concatenate((xw[:src_size], zw[:trg_size])).T\

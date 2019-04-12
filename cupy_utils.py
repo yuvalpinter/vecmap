@@ -40,12 +40,17 @@ def get_array_module(x):
         return numpy
 
 
-def get_sparse_module(x, dtype='float32'):
+def get_sparse_module(x, dtype='float32', normalize=False):
     if cupy is not None:
         if type(x) == gpu_sm:
+            if normalize:
+                raise NotImplementedError("can't directly normalize cupy sparse matrix")
             return x
         elif type(x) == cupy.ndarray:
+            x /= x.sum()
             return gpu_sm(x)
+        if normalize:
+            x /= x.sum()
         return gpu_sm(x.astype(dtype))
     else:
         return cpu_sm(x)
