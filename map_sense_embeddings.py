@@ -136,6 +136,7 @@ def main():
     self_learning_group.add_argument('-v', '--verbose', action='store_true', help='write log information to stderr at each iteration')
     
     future_group = parser.add_argument_group('experimental arguments', 'Experimental arguments')
+    future_group.add_argument('--psinv', default=None, help='Pre-saved pseudo-inverse matrix for sense embeddings')
     future_group.add_argument('--trim_senses', action='store_true', help='Trim sense table to working vocab')
     future_group.add_argument('--lamb', type=float, default=0.5, help='Weight hyperparameter for sense alignment objectives')
     future_group.add_argument('--reglamb', type=float, default=1., help='Lasso regularization hyperparameter')
@@ -164,7 +165,7 @@ def main():
     if args.toy:
         parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=50, csls_neighborhood=10, trim_senses=True, inv_delta=1., reglamb=0.2, lasso_iters=100, gd_wd=True, log='map-toy.log')
     if args.unsupervised or args.future:
-        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=2000, csls_neighborhood=10, trim_senses=True, gd_wd=True)
+        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=2000, csls_neighborhood=10, trim_senses=True, gd_wd=True, psinv='data/synsets/v3b_psinv.pkl')
     if args.unsupervised or args.acl2018:
         parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=20000, csls_neighborhood=10)
     args = parser.parse_args()
@@ -271,9 +272,14 @@ def main():
     ### TODO maybe try gradient descent instead?
     ### TODO (pre-)create non-singular alignment matrix
     cc = xp.empty((sense_size, emb_dim), dtype=dtype)  # \tilde{E}
-    print('starting psinv calc')
     t01 = time.time()
-    src_sns_psinv = psinv(src_senses, dtype, args.inv_delta)
+    if args.psinv is not None:
+        print(f'loading psinv from {args.psinv}')
+        with open(args.psinv,'rb') as psinv_file:
+            src_sns_psinv = pickle.load(psinv_file)
+    else:
+        print('starting psinv calc')
+        src_sns_psinv = psinv(src_senses, dtype, args.inv_delta)
     xecc = x[:src_size].T.dot(get_sparse_module(src_senses).toarray()).T  # sense_size * emb_dim
     cc[:] = src_sns_psinv.dot(xecc)
     print(f'initialized concept embeddings in {time.time()-t01:.2f} seconds', file=sys.stderr)
