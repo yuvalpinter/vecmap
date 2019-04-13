@@ -365,8 +365,8 @@ def main():
                     tg_grad_b = (zw[i:batch_end] - trg_senses[i:batch_end].dot(cc)).dot(cc.T)
                     
                     # proximal gradient
-                    tg_grad_b -= prox_lambda
-                    tg_grad_b.clip(0.0, out=tg_grad_b)
+                    tg_grad_b += prox_lambda
+                    tg_grad_b.clip(None, 0.0, out=tg_grad_b)
                     batch_grads.append(batch_sparse(tg_grad_b))
                     
                 tg_grad = get_sparse_module(vstack(batch_grads))
@@ -376,7 +376,7 @@ def main():
                     prox_lambda *= args.base_prox_lambda
                 
                 ### TODO consider weight decay here as well (args.gd_wd)
-                trg_senses += map_gd_lr * tg_grad
+                trg_senses -= map_gd_lr * tg_grad
             
                 # allow up to sense_limit nonzeros
                 if trg_sense_limit > 0:
@@ -441,9 +441,10 @@ def main():
         
         ### update projections (3,5)
         # write to zw and xw
-        # xecc is constant
         if args.orthogonal or not end:
             time3 = time.time()
+            
+            # source side - mappings don't change so xecc is constant
             u, s, vt = xp.linalg.svd(cc.T.dot(xecc))
             wx = vt.T.dot(u.T).astype(dtype)
             x.dot(wx, out=xw)
@@ -452,105 +453,57 @@ def main():
             
             time3 = time.time()
             
+            # target side - compute sense mapping first
             zecc.fill(0.)
             for i in range(0, trg_size, args.trg_batch):
                 end_idx = min(i+args.trg_batch, trg_size)
                 zecc += z[i:end_idx].T.dot(get_sparse_module(trg_senses[i:end_idx]).toarray()).T
-            # this used to work instead of above, until 552f02e
-            #zecc = z[:trg_size].T.dot(get_sparse_module(trg_senses).toarray()).T
             u, s, vt = xp.linalg.svd(cc.T.dot(zecc))
             wz = vt.T.dot(u.T).astype(dtype)
             z.dot(wz, out=zw)
             if args.verbose:
                 print(f'target projection update: {time.time()-time3:.2f}', file=sys.stderr)
             
-        else:  # advanced mapping
-            break ### TODO strip for parts
-
-            # remove lower-rank transformations
-            midpoint = src_size * args.max_align
-            src_indices = xp.concatenate((src_indices[:src_size], src_indices[midpoint:midpoint+trg_size]))
-            trg_indices = xp.concatenate((trg_indices[:src_size], trg_indices[midpoint:midpoint+trg_size]))
-            
-            # TODO xw.dot(wx2, out=xw) and alike not working
-            xw[:] = x
-            zw[:] = z
-            
-            ### TODO entry point for adding more matrix operations ###
-
-            # STEP 1: Whitening
-            def whitening_transformation(m):
-                u, s, vt = xp.linalg.svd(m, full_matrices=False)
-                return vt.T.dot(xp.diag(1/s)).dot(vt)
-            if args.whiten:
-                wx1 = whitening_transformation(xw[src_indices])
-                wz1 = whitening_transformation(zw[trg_indices])
-                xw = xw.dot(wx1)
-                zw = zw.dot(wz1)
-
-            # STEP 2: Orthogonal mapping
-            wx2, s, wz2_t = xp.linalg.svd(xw[src_indices].T.dot(zw[trg_indices]))
-            wz2 = wz2_t.T
-            xw = xw.dot(wx2)
-            zw = zw.dot(wz2)
-
-            # STEP 3: Re-weighting
-            xw *= s**args.src_reweight
-            zw *= s**args.trg_reweight
-
-            # STEP 4: De-whitening
-            if args.src_dewhiten == 'src':
-                xw = xw.dot(wx2.T.dot(xp.linalg.inv(wx1)).dot(wx2))
-            elif args.src_dewhiten == 'trg':
-                xw = xw.dot(wz2.T.dot(xp.linalg.inv(wz1)).dot(wz2))
-            if args.trg_dewhiten == 'src':
-                zw = zw.dot(wx2.T.dot(xp.linalg.inv(wx1)).dot(wx2))
-            elif args.trg_dewhiten == 'trg':
-                zw = zw.dot(wz2.T.dot(xp.linalg.inv(wz1)).dot(wz2))
-
-            # STEP 5: Dimensionality reduction (default: OFF (0))
-            if args.dim_reduction > 0:
-                xw = xw[:, :args.dim_reduction]
-                zw = zw[:, :args.dim_reduction]
+        ### TODO add parts from 'advanced mapping' part - transformations, whitening, etc.
         
+        # Objective function evaluation
+        time_obj = time.time()
+        trg_senses_l1 = float(trg_senses.sum())
+        src_obj = (float(xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2) / 2
+        trg_obj = (float(xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2
+        objective = src_obj + trg_obj + regularization_lambda * trg_senses_l1  # TODO consider thresholding reg part
+        if args.verbose:
+            print(f'objective calculation: {time.time()-time_obj:.2f}', file=sys.stderr)
+        
+        if objective - best_objective <= -args.threshold:
+            last_improvement = it
+            best_objective = objective
+
+        # WordNet transduction evaluation (can't tune on this)
+        if args.gold_pairs is not None:
+            np_trg_senses = trg_senses.get()
+            trg_corr = [p for p in gold_pairs if np_trg_senses[p] > args.gold_threshold]
+            correct_mappings = len(trg_corr)
+            domain_trgs = np_trg_senses[gold_trgs][:,gold_senses]
+        else:
+            correct_mappings = -1
+        
+        # Logging
+        duration = time.time() - t
+        if args.verbose:
+            print('ITERATION {0} ({1:.2f}s)'.format(it, duration), file=sys.stderr)
+            print('objective: {0:.3f}'.format(objective), file=sys.stderr)
+            print('target senses l_1 norm: {0:.3f}'.format(trg_senses_l1), file=sys.stderr)
+            if len(gold_pairs) > 0:
+                print(f'{correct_mappings} correct target mappings: {(correct_mappings/len(gold_pairs)):.3f} recall, {(correct_mappings/domain_trgs.getnnz()):.3f} precision', file=sys.stderr)
+            print(file=sys.stderr)
+            sys.stderr.flush()
+        if args.log is not None:
+            print(f'{it}\t{objective:.3f}\t{src_obj:.3f}\t{trg_obj:.3f}\t{trg_senses_l1:.3f}\t{duration:.3f}\t{trg_senses.getnnz()}\t{correct_mappings}', file=log)
+            log.flush()
+
         if end:
             break
-        else:
-            # Objective function evaluation
-            time_obj = time.time()
-            trg_senses_l1 = float(trg_senses.sum())
-            src_obj = (float(xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2) / 2
-            trg_obj = (float(xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2
-            objective = src_obj + trg_obj + regularization_lambda * trg_senses_l1  # TODO consider thresholding reg part
-            if args.verbose:
-                print(f'objective calculation: {time.time()-time_obj:.2f}', file=sys.stderr)
-            
-            if objective - best_objective <= -args.threshold:
-                last_improvement = it
-                best_objective = objective
-
-            # WordNet transduction evaluation (can't tune on this)
-            if args.gold_pairs is not None:
-                np_trg_senses = trg_senses.get()
-                trg_corr = [p for p in gold_pairs if np_trg_senses[p] > args.gold_threshold]
-                correct_mappings = len(trg_corr)
-                domain_trgs = np_trg_senses[gold_trgs][:,gold_senses]
-            else:
-                correct_mappings = -1
-            
-            # Logging
-            duration = time.time() - t
-            if args.verbose:
-                print('ITERATION {0} ({1:.2f}s)'.format(it, duration), file=sys.stderr)
-                print('objective: {0:.3f}'.format(objective), file=sys.stderr)
-                print('target senses l_1 norm: {0:.3f}'.format(trg_senses_l1), file=sys.stderr)
-                if len(gold_pairs) > 0:
-                    print(f'{correct_mappings} correct target mappings: {(correct_mappings/len(gold_pairs)):.3f} recall, {(correct_mappings/domain_trgs.getnnz()):.3f} precision', file=sys.stderr)
-                print(file=sys.stderr)
-                sys.stderr.flush()
-            if args.log is not None:
-                print(f'{it}\t{objective:.3f}\t{src_obj:.3f}\t{trg_obj:.3f}\t{trg_senses_l1:.3f}\t{duration:.3f}\t{trg_senses.getnnz()}\t{correct_mappings}', file=log)
-                log.flush()
 
         t = time.time()
         it += 1
