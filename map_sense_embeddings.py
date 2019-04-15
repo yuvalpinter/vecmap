@@ -365,7 +365,7 @@ def main():
                 dists = zw[i:batch_end].dot(cc.T)
                 dists -= knn_sense/2 # equivalent to the real CSLS scores for NN
                 best_idcs = dists.argmax(1).tolist()
-                trg_senses[(list(range(i,batch_end)), best_idcs)] = 1
+                trg_senses[(list(range(i,batch_end)), best_idcs)] = dists.max(1).tolist()
                 
             trg_senses = get_sparse_module(trg_senses.tocsr())
             
