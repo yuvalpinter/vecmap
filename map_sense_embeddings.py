@@ -144,6 +144,7 @@ def main():
     future_group.add_argument('--iterations', type=int, default=-1, help='Number of overall model iterations')
     future_group.add_argument('--trg_batch', type=int, default=5000, help='Batch size for target steps')
     future_group.add_argument('--trg_knn', action='store_true', help='Perform target sense mapping by k-nearest neighbors')
+    future_group.add_argument('--senses_per_trg', type=int, default=1, help='K-max target sense mapping (default = 1 = off)')
     future_group.add_argument('--gd', action='store_true', help='Apply gradient descent for assignment and synset embeddings')
     future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD (default=0.01)')
     future_group.add_argument('--gd_wd', action='store_true', help='Weight decay in SGD')
@@ -362,10 +363,16 @@ def main():
             trg_senses = lil_matrix(trg_senses.shape)
             for i in range(0, trg_size, args.trg_batch):
                 batch_end = min(i+args.trg_batch, trg_size)
-                dists = zw[i:batch_end].dot(cc.T)
-                dists -= knn_sense/2 # equivalent to the real CSLS scores for NN
-                best_idcs = dists.argmax(1).tolist()
-                trg_senses[(list(range(i,batch_end)), best_idcs)] = dists.max(1).tolist()
+                sims = zw[i:batch_end].dot(cc.T)
+                sims -= knn_sense/2 # equivalent to the real CSLS scores for NN
+                best_idcs = sims.argmax(1).tolist()
+                trg_senses[(list(range(i,batch_end)), best_idcs)] = sims.max(1).tolist()
+                
+                # second-to-lth-best
+                for l in range(args.senses_per_trg - 1):
+                    sims[(list(range(sims.shape[0])), best_idcs)] = 0.
+                    best_idcs = sims.argmax(1).tolist()
+                    trg_senses[(list(range(i,batch_end)), best_idcs)] = sims.max(1).tolist()
                 
             trg_senses = get_sparse_module(trg_senses.tocsr())
             
