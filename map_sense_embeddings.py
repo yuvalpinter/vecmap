@@ -16,6 +16,7 @@
 
 import embeddings
 from cupy_utils import *
+from map_embeddings import topk_mean
 
 import argparse
 import numpy as np
@@ -23,7 +24,7 @@ import sys
 import time
 import pickle
 from math import floor, pow
-from scipy.sparse import csr_matrix, csc_matrix, dia_matrix, identity, vstack, hstack
+from scipy.sparse import csr_matrix, csc_matrix, dia_matrix, lil_matrix, identity, vstack, hstack
 from scipy.sparse.linalg import inv, cg
 from sklearn.linear_model import Lasso
 
@@ -127,7 +128,6 @@ def main():
     
     self_learning_group = parser.add_argument_group('advanced self-learning arguments', 'Advanced arguments for self-learning')
     self_learning_group.add_argument('--vocabulary_cutoff', type=int, default=0, help='restrict the vocabulary to the top k entries')
-    self_learning_group.add_argument('--csls', type=int, nargs='?', default=0, const=10, metavar='NEIGHBORHOOD_SIZE', dest='csls_neighborhood', help='use CSLS for dictionary induction')
     self_learning_group.add_argument('--threshold', default=0.000001, type=float, help='the convergence threshold (defaults to 0.000001)')
     self_learning_group.add_argument('--stochastic_initial', default=0.1, type=float, help='initial keep probability stochastic dictionary induction (defaults to 0.1)')
     self_learning_group.add_argument('--stochastic_multiplier', default=2.0, type=float, help='stochastic dictionary induction multiplier (defaults to 2.0)')
@@ -143,6 +143,7 @@ def main():
     future_group.add_argument('--lasso_iters', type=int, default=10, help='Number of iterations for LASSO/NMF')
     future_group.add_argument('--iterations', type=int, default=-1, help='Number of overall model iterations')
     future_group.add_argument('--trg_batch', type=int, default=5000, help='Batch size for target steps')
+    future_group.add_argument('--trg_knn', action='store_true', help='Perform target sense mapping by k-nearest neighbors')
     future_group.add_argument('--gd', action='store_true', help='Apply gradient descent for assignment and synset embeddings')
     future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD (default=0.01)')
     future_group.add_argument('--gd_wd', action='store_true', help='Weight decay in SGD')
@@ -162,11 +163,11 @@ def main():
 
     # pre-setting groups
     if args.toy:
-        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=50, csls_neighborhood=10, trim_senses=True, inv_delta=1., reglamb=0.2, lasso_iters=100, gd_wd=True, log='map-toy.log')
+        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=50, trim_senses=True, inv_delta=1., reglamb=0.2, lasso_iters=100, gd_wd=True, log='map-toy.log')
     if args.unsupervised or args.future:
-        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=2000, csls_neighborhood=10, trim_senses=True, gd_wd=True)
+        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=2000, trim_senses=True, gd_wd=True)
     if args.unsupervised or args.acl2018:
-        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=20000, csls_neighborhood=10)
+        parser.set_defaults(init_unsupervised=True, unsupervised_vocab=4000, normalize=['unit', 'center', 'unit'], whiten=True, src_reweight=0.5, trg_reweight=0.5, src_dewhiten='src', trg_dewhiten='trg', vocabulary_cutoff=20000)
     args = parser.parse_args()
 
     # Check command line arguments
@@ -262,6 +263,7 @@ def main():
     if args.gold_pairs is not None:
         with open(args.gold_pairs,'rb') as gold_pairs_f:
             gold_pairs = pickle.load(gold_pairs_f)
+            gold_pairs = [(i,j) for i,j in gold_pairs if i < src_senses.shape[0] and j < src_senses.shape[1]]
         gold_trgs = sorted(set([x[0] for x in gold_pairs]))
         gold_senses = sorted(set([x[1] for x in gold_pairs]))
         gold_domain_size = len(gold_trgs) * len(gold_senses)
@@ -348,7 +350,26 @@ def main():
         time6 = time.time()
         # optimize: 0.5 * (xp.linalg.norm(zw[i] - trg_senses[i].dot(cc))^2) + (regularization_lambda * xp.linalg.norm(trg_senses[i],1))
         
-        if args.gd:
+        if args.trg_knn:
+            # for csls-based neighborhoods
+            knn_sense = xp.full(sense_size, -100)
+            for i in range(0, sense_size, args.trg_batch):  # TODO new argument if needed
+                batch_end = min(i+args.trg_batch, sense_size)
+                sim_sense_trg = cc[i:batch_end].dot(zw[:trg_size].T)
+                knn_sense[i:batch_end] = topk_mean(sim_sense_trg, k=10, inplace=True)
+            
+            # calculate new target mappings
+            trg_senses = lil_matrix(trg_senses.shape)
+            for i in range(0, trg_size, args.trg_batch):
+                batch_end = min(i+args.trg_batch, trg_size)
+                dists = zw[i:batch_end].dot(cc.T)
+                dists -= knn_sense/2 # equivalent to the real CSLS scores for NN
+                best_idcs = dists.argmax(1).tolist()
+                trg_senses[(list(range(i,batch_end)), best_idcs)] = 1
+                
+            trg_senses = get_sparse_module(trg_senses.tocsr())
+            
+        elif args.gd:
             if args.gd_wd:
                 true_it = (it-1) * args.gd_map_steps
                 map_gd_lr = args.gd_lr * pow(0.5, floor((1+true_it)/args.gd_wd_hl))
@@ -423,7 +444,7 @@ def main():
                 cc_grad = all_senses.T.dot(aw - all_senses.dot(cc))
                 cc_grad.clip(-args.gd_clip, args.gd_clip, out=cc_grad)
                 cc += emb_gd_lr * cc_grad
-                        
+                
         else:
             all_senses = get_sparse_module(vstack((src_senses, trg_senses), format='csr'))
             xzecc = xp.concatenate((xw[:src_size], zw[:trg_size])).T\
