@@ -144,6 +144,7 @@ def main():
     future_group.add_argument('--iterations', type=int, default=-1, help='Number of overall model iterations')
     future_group.add_argument('--trg_batch', type=int, default=5000, help='Batch size for target steps')
     future_group.add_argument('--trg_knn', action='store_true', help='Perform target sense mapping by k-nearest neighbors')
+    future_group.add_argument('--trg_sns_csls', type=int, default=10, help='K-nearest neighbors for CSLS target sense search')
     future_group.add_argument('--senses_per_trg', type=int, default=1, help='K-max target sense mapping (default = 1 = off)')
     future_group.add_argument('--gd', action='store_true', help='Apply gradient descent for assignment and synset embeddings')
     future_group.add_argument('--gd_lr', type=float, default=1e-2, help='Learning rate for SGD (default=0.01)')
@@ -354,10 +355,10 @@ def main():
         if args.trg_knn:
             # for csls-based neighborhoods
             knn_sense = xp.full(sense_size, -100)
-            for i in range(0, sense_size, args.trg_batch):  # TODO new argument if needed
+            for i in range(0, sense_size, args.trg_batch):
                 batch_end = min(i+args.trg_batch, sense_size)
                 sim_sense_trg = cc[i:batch_end].dot(zw[:trg_size].T)
-                knn_sense[i:batch_end] = topk_mean(sim_sense_trg, k=10, inplace=True)
+                knn_sense[i:batch_end] = topk_mean(sim_sense_trg, k=args.trg_sns_csls, inplace=True)
             
             # calculate new target mappings
             trg_senses = lil_matrix(trg_senses.shape)
