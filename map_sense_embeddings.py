@@ -136,6 +136,7 @@ def main():
     self_learning_group.add_argument('-v', '--verbose', action='store_true', help='write log information to stderr at each iteration')
     
     future_group = parser.add_argument_group('experimental arguments', 'Experimental arguments')
+    future_group.add_argument('--skip_top', type=int, default=0, help='Top k words to skip, presumably function')
     future_group.add_argument('--trim_senses', action='store_true', help='Trim sense table to working vocab')
     future_group.add_argument('--lamb', type=float, default=0.5, help='Weight hyperparameter for sense alignment objectives')
     future_group.add_argument('--reglamb', type=float, default=1., help='Lasso regularization hyperparameter')
@@ -238,13 +239,16 @@ def main():
     xw[:] = x
     zw[:] = z
     
-    src_size = x.shape[0] if args.vocabulary_cutoff <= 0 else min(x.shape[0], args.vocabulary_cutoff)
-    trg_size = z.shape[0] if args.vocabulary_cutoff <= 0 else min(z.shape[0], args.vocabulary_cutoff)
+    src_size = x.shape[0] if args.vocabulary_cutoff <= 0 else min(x.shape[0] - args.skip_top, args.vocabulary_cutoff)
+    trg_size = z.shape[0] if args.vocabulary_cutoff <= 0 else min(z.shape[0] - args.skip_top, args.vocabulary_cutoff)
     emb_dim = x.shape[1]
+    
+    cutoff_end = min(src_size + args.skip_top, x.shape[0])
     
     if args.trim_senses:
         # reshape sense assignment
-        src_senses = src_senses[:src_size]
+        src_senses = src_senses[args.skip_top:cutoff_end]
+        
         # new columns for words with no senses in original input
         ### TODO might also need this if not trimming (probably kinda far away)
         newcols = [csc_matrix(([1],([i],[0])),shape=(src_size,1)) for i in range(src_size)\
@@ -265,7 +269,8 @@ def main():
     if args.gold_pairs is not None:
         with open(args.gold_pairs,'rb') as gold_pairs_f:
             gold_pairs = pickle.load(gold_pairs_f)
-            gold_pairs = [(i,j) for i,j in gold_pairs if i < src_senses.shape[0] and j < src_senses.shape[1]]
+            gold_pairs = [(i-args.skip_top,j) for i,j in gold_pairs \
+                          if i >= args.skip_top and i < src_senses.shape[0] and j < src_senses.shape[1]]
         gold_trgs = sorted(set([x[0] for x in gold_pairs]))
         gold_senses = sorted(set([x[1] for x in gold_pairs]))
         gold_domain_size = len(gold_trgs) * len(gold_senses)
@@ -278,7 +283,7 @@ def main():
     t01 = time.time()
     print('starting psinv calc')
     src_sns_psinv = psinv(src_senses, dtype, args.inv_delta)
-    xecc = x[:src_size].T.dot(get_sparse_module(src_senses).toarray()).T  # sense_size * emb_dim
+    xecc = x[args.skip_top:cutoff_end].T.dot(get_sparse_module(src_senses).toarray()).T  # sense_size * emb_dim
     cc[:] = src_sns_psinv.dot(xecc)
     print(f'initialized concept embeddings in {time.time()-t01:.2f} seconds', file=sys.stderr)
     if args.verbose:
@@ -357,27 +362,31 @@ def main():
             knn_sense = xp.full(sense_size, -100)
             for i in range(0, sense_size, args.trg_batch):
                 batch_end = min(i+args.trg_batch, sense_size)
-                sim_sense_trg = cc[i:batch_end].dot(zw[:trg_size].T)
+                sim_sense_trg = cc[i:batch_end].dot(zw[args.skip_top:cutoff_end].T)
                 knn_sense[i:batch_end] = topk_mean(sim_sense_trg, k=args.trg_sns_csls, inplace=True)
             
             # calculate new target mappings
             trg_senses = lil_matrix(trg_senses.shape)
             for i in range(0, trg_size, args.trg_batch):
-                batch_end = min(i+args.trg_batch, trg_size)
-                sims = zw[i:batch_end].dot(cc.T)
+                sns_batch_end = min(i+args.trg_batch, trg_size)
+                z_i = i+args.skip_top
+                z_batch_end = min(sns_batch_end+args.skip_top, zw.shape[0])
+                
+                sims = zw[z_i:z_batch_end].dot(cc.T)
                 sims -= knn_sense/2 # equivalent to the real CSLS scores for NN
                 best_idcs = sims.argmax(1).tolist()
-                trg_senses[(list(range(i,batch_end)), best_idcs)] = sims.max(1).tolist()
+                trg_senses[(list(range(i,sns_batch_end)), best_idcs)] = sims.max(1).tolist()
                 
                 # second-to-lth-best
                 for l in range(args.senses_per_trg - 1):
                     sims[(list(range(sims.shape[0])), best_idcs)] = 0.
                     best_idcs = sims.argmax(1).tolist()
-                    trg_senses[(list(range(i,batch_end)), best_idcs)] = sims.max(1).tolist()
+                    trg_senses[(list(range(i,sns_batch_end)), best_idcs)] = sims.max(1).tolist()
                 
             trg_senses = get_sparse_module(trg_senses.tocsr())
             
         elif args.gd:
+            ### TODO add args.skip_top calculations
             if args.gd_wd:
                 true_it = (it-1) * args.gd_map_steps
                 map_gd_lr = args.gd_lr * pow(0.5, floor((1+true_it)/args.gd_wd_hl))
@@ -414,6 +423,7 @@ def main():
             ### TODO consider finishing up with lasso (maybe only in final iteration)
             
         else:
+            ### TODO add args.skip_top calculations
             # parallel LASSO (no cuda impl)
             cccpu = cc.get().T  # emb_dim * sense_size
             lasso_model.fit(cccpu, zw[:trg_size].get().T)
@@ -422,8 +432,8 @@ def main():
         
         if args.verbose:
             print(f'target sense mapping step: {(time.time()-time6):.2f} seconds, {trg_senses.getnnz()} nonzeros', file=sys.stderr)
-            objective = ((xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro') ** 2)\
-                            + (xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2 \
+            objective = ((xp.linalg.norm(xw[args.skip_top:cutoff_end] - get_sparse_module(src_senses).dot(cc),'fro') ** 2)\
+                            + (xp.linalg.norm(zw[args.skip_top:cutoff_end] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2 \
                         + regularization_lambda * trg_senses.sum()  # TODO consider thresholding reg part
             objective = float(objective)
             print(f'objective: {objective:.3f}')
@@ -436,17 +446,18 @@ def main():
         time10 = time.time()
         if args.gd:
             ### TODO probably handle sizes and/or threshold sparse matrix
-            ### TODO see if it's better to implement vstack over cupy alone, from:
-            ### https://github.com/scipy/scipy/blob/v1.2.1/scipy/sparse/construct.py#L468-L499
             if args.gd_wd:
                 true_it = (it-1) * args.gd_emb_steps
                 emb_gd_lr = args.gd_lr * pow(0.5, floor((1+true_it)/args.gd_wd_hl))
                 if args.verbose:
                     print(f'embedding learning rate: {emb_gd_lr}')
             
+            ### replace block for no-source-tuning mode
             all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'), dtype=dtype)         
-            #all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'), dtype=dtype, normalize=True)
-            aw = xp.concatenate((xw[:src_size], zw[:trg_size]))            
+            aw = xp.concatenate((xw[args.skip_top:cutoff_end], zw[args.skip_top:cutoff_end]))            
+            
+            #all_senses = trg_senses
+            #aw = zw[:trg_size]
             
             for i in range(args.gd_emb_steps):
                 cc_grad = all_senses.T.dot(aw - all_senses.dot(cc))
@@ -454,6 +465,7 @@ def main():
                 cc += emb_gd_lr * cc_grad
                 
         else:
+            ### TODO add args.skip_top calculations
             all_senses = get_sparse_module(vstack((src_senses, trg_senses), format='csr'))
             xzecc = xp.concatenate((xw[:src_size], zw[:trg_size])).T\
                         .dot(all_senses.toarray()).T  # sense_size * emb_dim
@@ -462,8 +474,8 @@ def main():
             
         if args.verbose:
             print(f'synset embedding update: {time.time()-time10:.2f}', file=sys.stderr)
-            objective = ((xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2\
-                            + (xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2 \
+            objective = ((xp.linalg.norm(xw[args.skip_top:cutoff_end] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2\
+                            + (xp.linalg.norm(zw[args.skip_top:cutoff_end] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2 \
                         + regularization_lambda * trg_senses.sum()  # TODO consider thresholding reg part
             objective = float(objective)
             print(f'objective: {objective:.3f}')
@@ -471,18 +483,18 @@ def main():
         ### update projections (3,5)
         # write to zw and xw
         if args.orthogonal or not end:
-            time3 = time.time()
             
+            ### remove block for no-source-tuning mode
             # source side - mappings don't change so xecc is constant
+            time3 = time.time()
             u, s, vt = xp.linalg.svd(cc.T.dot(xecc))
             wx = vt.T.dot(u.T).astype(dtype)
             x.dot(wx, out=xw)
             if args.verbose:
                 print(f'source projection update: {time.time()-time3:.2f}', file=sys.stderr)
             
-            time3 = time.time()
-            
             # target side - compute sense mapping first
+            time3 = time.time()
             zecc.fill(0.)
             for i in range(0, trg_size, args.trg_batch):
                 end_idx = min(i+args.trg_batch, trg_size)
@@ -498,8 +510,8 @@ def main():
         # Objective function evaluation
         time_obj = time.time()
         trg_senses_l1 = float(trg_senses.sum())
-        src_obj = (float(xp.linalg.norm(xw[:src_size] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2) / 2
-        trg_obj = (float(xp.linalg.norm(zw[:trg_size] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2
+        src_obj = (float(xp.linalg.norm(xw[args.skip_top:cutoff_end] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2) / 2
+        trg_obj = (float(xp.linalg.norm(zw[args.skip_top:cutoff_end] - get_sparse_module(trg_senses).dot(cc),'fro')) ** 2) / 2
         objective = src_obj + trg_obj + regularization_lambda * trg_senses_l1  # TODO consider thresholding reg part
         if args.verbose:
             print(f'objective calculation: {time.time()-time_obj:.2f}', file=sys.stderr)
