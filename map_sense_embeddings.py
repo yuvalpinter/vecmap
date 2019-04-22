@@ -140,6 +140,7 @@ def main():
     future_group.add_argument('--trim_senses', action='store_true', help='Trim sense table to working vocab')
     future_group.add_argument('--lamb', type=float, default=0.5, help='Weight hyperparameter for sense alignment objectives')
     future_group.add_argument('--reglamb', type=float, default=1., help='Lasso regularization hyperparameter')
+    future_group.add_argument('--ccreglamb', type=float, default=0.1, help='Sense embedding regularization hyperparameter')
     future_group.add_argument('--inv_delta', type=float, default=0.0001, help='Delta_I added for inverting sense matrix')
     future_group.add_argument('--lasso_iters', type=int, default=10, help='Number of iterations for LASSO/NMF')
     future_group.add_argument('--iterations', type=int, default=-1, help='Number of overall model iterations')
@@ -460,7 +461,7 @@ def main():
             #aw = zw[:trg_size]
             
             for i in range(args.gd_emb_steps):
-                cc_grad = all_senses.T.dot(aw - all_senses.dot(cc))
+                cc_grad = all_senses.T.dot(aw - all_senses.dot(cc)) - args.ccreglamb * cc
                 cc_grad.clip(-args.gd_clip, args.gd_clip, out=cc_grad)
                 cc += emb_gd_lr * cc_grad
                 
