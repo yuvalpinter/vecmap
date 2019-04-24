@@ -23,6 +23,7 @@ import numpy as np
 import sys
 import time
 import pickle
+from tqdm import tqdm
 from math import floor, pow
 from scipy.sparse import csr_matrix, csc_matrix, dia_matrix, lil_matrix, identity, vstack, hstack
 from scipy.sparse.linalg import inv, cg
@@ -137,6 +138,7 @@ def main():
     
     future_group = parser.add_argument_group('experimental arguments', 'Experimental arguments')
     future_group.add_argument('--skip_top', type=int, default=0, help='Top k words to skip, presumably function')
+    future_group.add_argument('--start_src', action='store_true', help='Algorithm starts by tuning sense embeddings based on source')
     future_group.add_argument('--trim_senses', action='store_true', help='Trim sense table to working vocab')
     future_group.add_argument('--lamb', type=float, default=0.5, help='Weight hyperparameter for sense alignment objectives')
     future_group.add_argument('--reglamb', type=float, default=1., help='Lasso regularization hyperparameter')
@@ -343,6 +345,41 @@ def main():
     emb_gd_lr = args.gd_lr
     end = False
     print('starting training')
+    
+    if args.start_src:
+        print('starting with converging synset embeddings')
+        it_range = range(args.iterations)  ### TODO possibly add arg, but there's early stopping
+        if not args.verbose:
+            it_range = tqdm(it_range)
+        prev_obj = float('inf')
+        for pre_it in it_range:
+            if args.gd_wd:
+                emb_gd_lr = args.gd_lr * pow(0.5, floor(pre_it/args.gd_wd_hl))            
+            
+            # Synset embedding
+            cc_grad = src_senses.T.dot(xw[args.skip_top:cutoff_end] - src_senses.dot(cc)) - args.ccreglamb * cc
+            cc_grad.clip(-args.gd_clip, args.gd_clip, out=cc_grad)
+            cc += emb_gd_lr * cc_grad
+            
+            # Source projection
+            u, s, vt = xp.linalg.svd(cc.T.dot(xecc))
+            wx = vt.T.dot(u.T).astype(dtype)
+            x.dot(wx, out=xw)
+            
+            pre_objective = ((xp.linalg.norm(xw[args.skip_top:cutoff_end] - get_sparse_module(src_senses).dot(cc),'fro')) ** 2) / 2
+            pre_objective = float(pre_objective)
+            
+            if args.verbose and pre_it > 0 and pre_it % 10 == 0:
+                print(f'source synset embedding objective iteration {pre_it}: {pre_objective:.3f}')
+            
+            if pre_objective > prev_obj:
+                print(f'stopping at pre-iteration {pre_it}, source-sense objective {prev_obj:.3f}')
+                # revert
+                cc -= emb_gd_lr * cc_grad
+                break
+                
+            prev_obj = pre_objective
+    
     while True:
         if it % 50 == 0:
             print(f'starting iteration {it}, last objective was {objective}, correct mappings at {correct_mappings}')
@@ -439,13 +476,13 @@ def main():
             objective = float(objective)
             print(f'objective: {objective:.3f}')
         
-        # Write target sense mapping (no time issue)
+        # Write target sense mapping
         with open(f'tmp_outs/{args.tsns_output[:-4]}-it{it:03d}.pkl', mode='wb') as tsnsfile:
             pickle.dump(trg_senses.get(), tsnsfile)
         
         ### update synset embeddings (10)
         time10 = time.time()
-        if args.gd:
+        if args.gd and args.gd_emb_steps > 0:
             ### TODO probably handle sizes and/or threshold sparse matrix
             if args.gd_wd:
                 true_it = (it-1) * args.gd_emb_steps
@@ -454,11 +491,8 @@ def main():
                     print(f'embedding learning rate: {emb_gd_lr}')
             
             ### replace block for no-source-tuning mode
-            all_senses = get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'), dtype=dtype)         
-            aw = xp.concatenate((xw[args.skip_top:cutoff_end], zw[args.skip_top:cutoff_end]))            
-            
-            #all_senses = trg_senses
-            #aw = zw[:trg_size]
+            all_senses = trg_senses if args.start_src else get_sparse_module(vstack((src_senses.get(), trg_senses.get()), format='csr'), dtype=dtype)
+            aw = zw[args.skip_top:cutoff_end] if args.start_src else xp.concatenate((xw[args.skip_top:cutoff_end], zw[args.skip_top:cutoff_end]))
             
             for i in range(args.gd_emb_steps):
                 cc_grad = all_senses.T.dot(aw - all_senses.dot(cc)) - args.ccreglamb * cc
@@ -487,6 +521,7 @@ def main():
             
             ### remove block for no-source-tuning mode
             # source side - mappings don't change so xecc is constant
+            #if not args.start_src:  # need to do this anyway whenever cc updates
             time3 = time.time()
             u, s, vt = xp.linalg.svd(cc.T.dot(xecc))
             wx = vt.T.dot(u.T).astype(dtype)
@@ -536,7 +571,7 @@ def main():
             print('ITERATION {0} ({1:.2f}s)'.format(it, duration), file=sys.stderr)
             print('objective: {0:.3f}'.format(objective), file=sys.stderr)
             print('target senses l_1 norm: {0:.3f}'.format(trg_senses_l1), file=sys.stderr)
-            if len(gold_pairs) > 0:
+            if len(gold_pairs) > 0 and domain_trgs.getnnz() > 0:
                 print(f'{correct_mappings} correct target mappings: {(correct_mappings/len(gold_pairs)):.3f} recall, {(correct_mappings/domain_trgs.getnnz()):.3f} precision', file=sys.stderr)
             print(file=sys.stderr)
             sys.stderr.flush()
